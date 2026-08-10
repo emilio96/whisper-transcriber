@@ -69,7 +69,9 @@ object AudioDecoder {
      * Must be invoked off the main thread.
      */
     fun decode(context: Context, uri: Uri, onProgress: ((Float) -> Unit)? = null): FloatArray {
-        val totalBytes = fileBytes(context, uri)
+        // -1L = size unknown from ContentResolver; the progress gauge is then
+        // skipped (the guard 'if (totalBytes > 0)' below handles it).
+        val totalBytes: Long = fileBytes(context, uri) ?: -1L
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
         try {
