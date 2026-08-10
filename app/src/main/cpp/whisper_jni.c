@@ -103,7 +103,7 @@ Java_com_emilio_whispert_whisper_WhisperLib_00024Companion_initContextFromInputS
         return 0;
     }
 
-    context = whisper_init(&loader);
+    context = whisper_init_with_params(&loader, whisper_context_default_params());
     return (jlong) context;
 }
 

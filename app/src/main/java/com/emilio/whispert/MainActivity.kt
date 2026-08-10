@@ -25,6 +25,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -32,7 +33,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.emilio.whispert.ui.theme.WhisperTranscriberTheme
 import com.emilio.whispert.whisper.WhisperContext
@@ -53,7 +53,7 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun MainScreen(vm: MainViewModel = viewModel()) {
-    val state by vm.state.collectAsStateWithLifecycle()
+    val state by vm.state.collectAsState()
 
     // SAF picker: lets us open any .bin / .gguf file the user downloaded. No
     // storage permission is required because the user actively selects the file.
