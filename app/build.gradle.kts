@@ -17,6 +17,22 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Compile the whisper.cpp native lib only for 64-bit ARM. Covers every
+        // modern device we ship to; keeps build time and APK size small.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+    }
+
+    // Where the CMake build for whisper.cpp lives.
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            // Use the CMake installed via SDK Manager (currently 4.1.2).
+            // Setting this explicitly avoids Gradle auto-downloading 3.22.x.
+            version = "4.1.2"
+        }
     }
 
     buildTypes {
@@ -33,6 +49,14 @@ android {
     buildFeatures {
         compose = true
     }
+
+    // Extract native libs to disk on install so System.loadLibrary works
+    // reliably against mmap-style model loading done by whisper_init_*.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
@@ -44,6 +68,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
