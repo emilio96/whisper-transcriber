@@ -6,6 +6,11 @@ import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.emilio.whispert.models.DeviceProfile
+import com.emilio.whispert.models.ModelDescriptor
+import com.emilio.whispert.models.ModelManager
+import com.emilio.whispert.models.ModelRegistry
+import com.emilio.whispert.whisper.AudioDecoder
 import com.emilio.whispert.whisper.WavHelper
 import com.emilio.whispert.whisper.WhisperContext
 import kotlinx.coroutines.Dispatchers
@@ -16,117 +21,294 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Tiny UI-busy state machine for the "hello transcribe" test screen.
+ * State holder for the whole app. Holds two slices:
+ *   - transcribe state (audio file, language, run result) — the "Transcribe" tab
+ *   - model library state (registry + download progress + active) — the "Models" tab
  *
- * It owns a [WhisperContext] and persists the SAF Uri of the chosen model so
- * the user doesn't have to re-pick it on every launch. Native memory is freed
- * in [onCleared] via [WhisperContext.releaseBlocking] (the ViewModel scope is
- * already being torn down, so a coroutine-based release would race the GC).
+ * Long-lived resources:
+ *   - [modelManager]  : downloads + caches ggml .bin files in filesDir/models
+ *   - [whisperCtx]    : native whisper context; pinned to a single worker thread
+ *     inside WhisperContext. Freed blocking in onCleared().
+ *
+ * The two slices talk through an explicit [ensureModelLoaded] gate before any
+ * transcription: there must be a downloaded+activated model, and the model must
+ * currently live in native memory; otherwise we materialise it from disk.
  */
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val prefs = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    private val _state = MutableStateFlow<UiState>(UiState.Idle)
-    val state: StateFlow<UiState> = _state.asStateFlow()
+    private val modelManager = ModelManager(app)
+    private val deviceProfile = DeviceProfile.probe(app)
 
     private var whisperCtx: WhisperContext? = null
+    private var loadedModelId: String? = null
 
-    init {
-        // Try to restore the previously chosen model Uri on cold start.
-        prefs.getString(KEY_MODEL_URI, null)?.let { uri ->
-            _state.value = UiState.Ready(uri, "(not yet loaded — press Transcribe to use)")
+    // ---------- transcribe slice ----------
+    private val _transcribeState = MutableStateFlow<TranscribeUiState>(TranscribeUiState.Idle)
+    val transcribeState: StateFlow<TranscribeUiState> = _transcribeState.asStateFlow()
+
+    private val _audioUri = MutableStateFlow<Uri?>(prefs.getString(KEY_AUDIO_URI, null)?.let { Uri.parse(it) })
+    val audioUri: StateFlow<Uri?> = _audioUri.asStateFlow()
+
+    private val _language = MutableStateFlow(prefs.getString(KEY_LANGUAGE, "auto") ?: "auto")
+    val language: StateFlow<String> = _language.asStateFlow()
+
+    // ---------- models slice ----------
+    private val _modelsState = MutableStateFlow(
+        ModelsUiState(
+            registry = ModelRegistry.ALL,
+            deviceClass = deviceProfile.deviceClass,
+            deviceDescription = deviceProfile.describe(),
+            modelStates = ModelRegistry.ALL.associate { it.id to stateFor(it) },
+            activeModelId = modelManager.activeModelId(),
+        )
+    )
+    val modelsState: StateFlow<ModelsUiState> = _modelsState.asStateFlow()
+
+    private fun stateFor(desc: ModelDescriptor): ModelItemState {
+        val cached = modelManager.isDownloaded(desc)
+        val active = modelManager.activeModelId() == desc.id
+        return ModelItemState(
+            descriptor = desc,
+            downloaded = cached,
+            active = active,
+            downloading = false,
+            progress = 0f,
+            error = null,
+        )
+    }
+
+    private fun refreshModelsState() {
+        val cur = _modelsState.value
+        _modelsState.value = cur.copy(
+            activeModelId = modelManager.activeModelId(),
+            modelStates = cur.modelStates.mapValues { (id, st) ->
+                val desc = ModelRegistry.byId(id)
+                st.copy(
+                    downloaded = modelManager.isDownloaded(desc),
+                    active = modelManager.activeModelId() == id,
+                )
+            }
+        )
+    }
+
+    // ---------- audio selection ----------
+    fun onAudioPicked(uri: Uri) {
+        viewModelScope.launch {
+            // Persist permission so the Uri survives a relaunch without re-picking.
+            runCatching {
+                val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                getApplication<Application>().contentResolver.takePersistableUriPermission(uri, flags)
+            }
+            prefs.edit().putString(KEY_AUDIO_URI, uri.toString()).apply()
+            _audioUri.value = uri
         }
     }
 
-    /** Called when the user picks a model file via the SAF picker. */
-    fun onModelPicked(uri: Uri) {
+    fun clearAudio() {
+        prefs.edit().remove(KEY_AUDIO_URI).apply()
+        _audioUri.value = null
+    }
+
+    fun setLanguage(lang: String) {
+        prefs.edit().putString(KEY_LANGUAGE, lang).apply()
+        _language.value = lang
+    }
+
+    // ---------- model library actions ----------
+    fun downloadModel(desc: ModelDescriptor) {
+        // Avoid concurrent downloads of the same id.
+        if (_modelsState.value.modelStates[desc.id]?.downloading == true) return
+        updateItem(desc.id) { it.copy(downloading = true, progress = 0f, error = null) }
+
         viewModelScope.launch {
-            _state.value = UiState.Busy("Decoding model header…")
             try {
-                // Persist permission so we can reopen on next launch without re-picking.
-                runCatching {
-                    val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    getApplication<Application>().contentResolver.takePersistableUriPermission(uri, flags)
-                }
-                prefs.edit().putString(KEY_MODEL_URI, uri.toString()).apply()
-
-                // Drop any previous context before creating a fresh one.
-                whisperCtx?.releaseBlocking()
-                whisperCtx = null
-
-                _state.value = UiState.Busy("Loading model into native memory…")
-                val ctx = withContext(Dispatchers.IO) {
-                    val stream = getApplication<Application>()
-                        .contentResolver.openInputStream(uri)
-                        ?: error("Cannot open InputStream for $uri")
-                    WhisperContext.createContextFromInputStream(stream).also { stream.close() }
-                }
-                whisperCtx = ctx
-                _state.value = UiState.Ready(uri.toString(), "Model loaded — ready to transcribe.")
+                modelManager.download(desc) { p -> updateItem(desc.id) { it.copy(progress = p) } }
+                updateItem(desc.id) { it.copy(downloading = false, downloaded = true, progress = 1f, error = null) }
+                refreshModelsState()
             } catch (t: Throwable) {
-                _state.value = UiState.Error("Model load failed: ${t.message ?: t.toString()}")
+                updateItem(desc.id) { it.copy(downloading = false, progress = 0f, error = t.message ?: t.toString()) }
             }
         }
     }
 
-    /**
-     * Transcribes the bundled 16 kHz mono test sample (assets/samples/jfk.wav)
-     * with the currently loaded whisper model. This is the "hello transcribe"
-     * smoke test that validates the entire native stack end-to-end.
-     */
-    fun transcribeTestSample(language: String = "en") {
-        val ctx = whisperCtx
-        if (ctx == null) {
-            _state.value = UiState.Error("Pick a model file first.")
+    fun deleteModel(desc: ModelDescriptor) {
+        modelManager.deleteModel(desc)
+        refreshModelsState()
+        // If this was the loaded model, drop the native context.
+        if (loadedModelId == desc.id) {
+            whisperCtx?.releaseBlocking()
+            whisperCtx = null
+            loadedModelId = null
+        }
+    }
+
+    fun activateModel(desc: ModelDescriptor) {
+        if (!modelManager.isDownloaded(desc)) return
+        modelManager.setActiveModelId(desc.id)
+        refreshModelsState()
+    }
+
+
+    private fun updateItem(id: String, block: (ModelItemState) -> ModelItemState) {
+        val cur = _modelsState.value
+        _modelsState.value = cur.copy(modelStates = cur.modelStates.mapValues { (k, v) ->
+            if (k == id) block(v) else v
+        })
+    }
+
+    // ---------- transcription ----------
+    fun transcribe() {
+        val uri = _audioUri.value
+        if (uri == null) {
+            _transcribeState.value = TranscribeUiState.Error("Pick an audio file first.")
             return
         }
+
         viewModelScope.launch {
-            _state.value = UiState.Busy("Reading test audio file from assets…")
+            _transcribeState.value = TranscribeUiState.Busy("Checking model…")
             try {
+                val ctxOrError = ensureModelLoaded()
+                if (ctxOrError.err != null) {
+                    _transcribeState.value = TranscribeUiState.Error(ctxOrError.err)
+                    return@launch
+                }
+                val ctx = ctxOrError.ctx!!
+                val activeDesc = ctxOrError.desc
+
+                val language = effectiveLanguage(activeDesc)
+
+                _transcribeState.value = TranscribeUiState.Busy("Decoding audio…")
+                val start = System.currentTimeMillis()
+                val samples = withContext(Dispatchers.IO) {
+                    AudioDecoder.decode(getApplication(), uri) { p ->
+                        _transcribeState.value = TranscribeUiState.Busy("Decoding audio… ${"%.0f".format(p * 100)}%")
+                    }
+                }
+
+                _transcribeState.value = TranscribeUiState.Busy("Whisper running… (${samples.size} samples)")
+                val text = ctx.transcribe(samples, language = language, printTimestamps = true)
+                val elapsed = System.currentTimeMillis() - start
+                _transcribeState.value = TranscribeUiState.Done(
+                    text = text,
+                    elapsedMs = elapsed,
+                    language = language,
+                    modelName = activeDesc.displayName,
+                    modelId = activeDesc.id,
+                    sampleCount = samples.size,
+                )
+            } catch (t: Throwable) {
+                _transcribeState.value = TranscribeUiState.Error("Transcribe failed: ${t.message ?: t.toString()}")
+            }
+        }
+    }
+
+    /** Smoke test that always uses the bundled jfk.wav, regardless of picked file. */
+    fun transcribeBundledJfk() {
+        viewModelScope.launch {
+            _transcribeState.value = TranscribeUiState.Busy("Checking model…")
+            try {
+                val ctxOrError = ensureModelLoaded()
+                if (ctxOrError.err != null) {
+                    _transcribeState.value = TranscribeUiState.Error(ctxOrError.err)
+                    return@launch
+                }
+                val ctx = ctxOrError.ctx!!
+                val activeDesc = ctxOrError.desc
+
+                val language = effectiveLanguage(activeDesc)
+                _transcribeState.value = TranscribeUiState.Busy("Reading test audio from assets…")
                 val start = System.currentTimeMillis()
                 val samples = withContext(Dispatchers.IO) {
                     getApplication<Application>().assets.open(TEST_SAMPLE).use {
                         WavHelper.decodePcm16ToMonoFloat(it)
                     }
                 }
-                _state.value = UiState.Busy("Whisper running… (${samples.size} samples)")
+                _transcribeState.value = TranscribeUiState.Busy("Whisper running… (${samples.size} samples)")
                 val text = ctx.transcribe(samples, language = language, printTimestamps = true)
                 val elapsed = System.currentTimeMillis() - start
-                _state.value = UiState.Done(
+                _transcribeState.value = TranscribeUiState.Done(
                     text = text,
                     elapsedMs = elapsed,
                     language = language,
+                    modelName = activeDesc.displayName,
+                    modelId = activeDesc.id,
                     sampleCount = samples.size,
                 )
             } catch (t: Throwable) {
-                _state.value = UiState.Error("Transcribe failed: ${t.message ?: t.toString()}")
+                _transcribeState.value = TranscribeUiState.Error("Transcribe failed: ${t.message ?: t.toString()}")
             }
         }
+    }
+
+    private fun effectiveLanguage(desc: ModelDescriptor): String =
+        if (desc.isEnglishOnly) "en" else _language.value
+
+    private data class ModelReady(val ctx: WhisperContext?, val desc: ModelDescriptor, val err: String?)
+
+    private suspend fun ensureModelLoaded(): ModelReady {
+        val active = modelManager.activeModel() ?: return ModelReady(null, ModelRegistry.ALL.first(),
+            "No model yet. Go to the Models tab and download one.")
+
+        if (loadedModelId != active.id || whisperCtx == null) {
+            _transcribeState.value = TranscribeUiState.Busy("Loading model '${active.displayName}'…")
+            whisperCtx?.releaseBlocking(); whisperCtx = null; loadedModelId = null
+            val file = modelManager.cachedFile(active)
+                ?: return ModelReady(null, active, "Model '${active.displayName}' file is missing. Re-download it.")
+            val ctx = withContext(Dispatchers.IO) {
+                WhisperContext.createContextFromFile(file.absolutePath)
+            }
+            whisperCtx = ctx
+            loadedModelId = active.id
+        }
+        return ModelReady(whisperCtx, active, null)
     }
 
     override fun onCleared() {
         super.onCleared()
         whisperCtx?.releaseBlocking()
         whisperCtx = null
+        loadedModelId = null
     }
 
     companion object {
-        private const val PREFS_NAME = "whispert"
-        private const val KEY_MODEL_URI = "model_uri"
+        private const val PREFS = "whispert"
+        private const val KEY_AUDIO_URI = "audio_uri"
+        private const val KEY_LANGUAGE = "language"
         private const val TEST_SAMPLE = "samples/jfk.wav"
     }
 }
 
-sealed interface UiState {
-    data object Idle : UiState
-    data class Busy(val message: String) : UiState
-    data class Ready(val modelUri: String, val note: String) : UiState
+// ---------- UI state contracts ----------
+
+sealed interface TranscribeUiState {
+    data object Idle : TranscribeUiState
+    data class Busy(val message: String) : TranscribeUiState
     data class Done(
         val text: String,
         val elapsedMs: Long,
         val language: String,
+        val modelName: String,
+        val modelId: String,
         val sampleCount: Int,
-    ) : UiState
-    data class Error(val message: String) : UiState
+    ) : TranscribeUiState
+    data class Error(val message: String) : TranscribeUiState
 }
+
+data class ModelItemState(
+    val descriptor: ModelDescriptor,
+    val downloaded: Boolean,
+    val active: Boolean,
+    val downloading: Boolean,
+    val progress: Float,
+    val error: String?,
+)
+
+data class ModelsUiState(
+    val registry: List<ModelDescriptor>,
+    val deviceClass: com.emilio.whispert.models.DeviceClass,
+    val deviceDescription: String,
+    val modelStates: Map<String, ModelItemState>,
+    val activeModelId: String?,
+)
