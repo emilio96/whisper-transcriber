@@ -103,7 +103,8 @@ object AudioDecoder {
                             codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                             sawInputEOS = true
                         } else {
-                            codec.queueInputBuffer(inIdx, 0, sampleSize, extractor.sampleTime, 0)
+                            val pts = extractor.sampleTime ?: 0L
+                            codec.queueInputBuffer(inIdx, 0, sampleSize, pts, 0)
                             extractor.advance()
                             totalBytesRead += sampleSize
                             if (totalBytes > 0) onProgress?.invoke((totalBytesRead.toFloat() / totalBytes).coerceIn(0f, 0.95f))

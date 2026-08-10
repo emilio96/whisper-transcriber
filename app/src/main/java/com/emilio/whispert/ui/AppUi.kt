@@ -17,14 +17,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -37,7 +34,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -57,7 +56,7 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
     val transcribeState by vm.transcribeState.collectAsState()
     val modelsState by vm.modelsState.collectAsState()
 
-    var selectedTab by androidx.compose.runtime.remember { androidx.compose.runtime.mutableIntStateOf(0) }
+    var selectedTab by remember { mutableIntStateOf(0) }
 
     Scaffold { inner ->
         Column(modifier = Modifier.padding(inner).fillMaxSize()) {
@@ -219,10 +218,11 @@ private fun ModelCard(
                 Text(item.descriptor.displayName, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.size(8.dp))
                 if (isRecommended) {
-                    Icon(Icons.Filled.Star, contentDescription = "Recommended for this device",
-                         tint = MaterialTheme.colorScheme.tertiary, modifier = Modifier.size(16.dp))
-                    Text("recommended", style = MaterialTheme.typography.labelSmall,
-                         color = MaterialTheme.colorScheme.tertiary)
+                    Text(
+                        "★ recommended",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
                 }
                 Spacer(Modifier.weight(1f))
                 if (item.active) Text("active", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
