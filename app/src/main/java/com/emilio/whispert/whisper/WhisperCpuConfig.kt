@@ -87,7 +87,7 @@ private class CpuInfo(private val lines: List<String>) {
         return (kept - 1).coerceAtLeast(2)
     }
 
-    private fun fallback(): Int {
+    fun fallback(): Int {
         val n = Runtime.getRuntime().availableProcessors()
         Log.d(LOG_TAG, "Using naive fallback: availableProcessors($n) - 1")
         return (n - 1).coerceAtLeast(2)
@@ -97,12 +97,17 @@ private class CpuInfo(private val lines: List<String>) {
         private const val LOG_TAG = "WhisperCpuConfig"
         private const val LOW_HIGH_RATIO_THRESHOLD = 0.70
 
-        fun computeThreadCount(): Int = try {
-            readCpuInfo().computeThreadCount()
-        } catch (e: Exception) {
-            Log.d(LOG_TAG, "Couldn't read /proc/cpuinfo", e)
-            CpuInfo(emptyList()).let {
-                runCatching { it.computeByVariant() }.getOrElse { it.fallback() }
+        fun computeThreadCount(): Int {
+            // Probe /proc/cpuinfo + sysfs frequencies. If anything fails, fall back.
+            return try {
+                readCpuInfo().computeThreadCount()
+            } catch (e: Exception) {
+                Log.d(LOG_TAG, "Couldn't read /proc/cpuinfo", e)
+                try {
+                    CpuInfo(emptyList()).computeByVariant()
+                } catch (e2: Exception) {
+                    CpuInfo(emptyList()).fallback()
+                }
             }
         }
 
