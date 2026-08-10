@@ -7,67 +7,103 @@ import java.io.FileReader
 /**
  * Decides how many threads to give whisper_full.
  *
- * On big.LITTLE mobile SoCs handing whisper_full every available CPU can be a
- * trap: the OS scheduler may put the heavy matmul onto the E-cores, making the
- * transcription several times slower. Instead we count only the **high-perf**
- * cores (by reading their max clock frequencies, falling back to the "CPU
- * variant" field) and use that count.
+ * Mobile SoCs are heterogeneous: classical big.LITTLE (1+3+4) has a slow
+ * efficiency cluster that we want to skip, whereas newer flagship designs like
+ * the Snapdragon 8 Elite ("2+6 Oryon": 2 prime + 6 performance, no real E-core)
+ * have two fast clusters where both are worth using. Picking N threads badly
+ * here is a 3x performance trap (we'd otherwise run on only the 2 prime cores).
  *
- * Xiaomi 17 (Snapdragon 8 Elite) reports 2 Phoenix-L prime + 4 Phoenix-M + 2
- * Phoenix-E cores: the prime + medium cluster is what we want.
+ * Heuristic:
+ *   1) Read max clock frequency of every CPU.
+ *   2) Compute ratio = lowestFreq / highestFreq.
+ *      - ratio >= 0.70  -> both clusters are fast (e.g., 2+6 Oryon) -> use all
+ *      - ratio <  0.70  -> lowest cluster is a genuine efficiency tier -> skip it
+ *   3) Reserve 1 core for the UI/Binder/RenderThread so the app stays responsive
+ *      while inference runs, but never go below 2 threads.
+ *   4) If anything goes wrong reading sysfs, fall back to availableProcessors-1.
  */
 object WhisperCpuConfig {
     val preferredThreadCount: Int
-        get() = CpuInfo.getHighPerfCpuCount().coerceAtLeast(2)
+        get() = CpuInfo.computeThreadCount().coerceAtLeast(2)
 }
 
 private class CpuInfo(private val lines: List<String>) {
 
-    private fun getHighPerfCpuCount(): Int = try {
-        getHighPerfCpuCountByFrequencies()
+    fun computeThreadCount(): Int = try {
+        computeByFrequencies()
     } catch (e: Exception) {
-        Log.d(LOG_TAG, "Couldn't read CPU frequencies", e)
-        getHighPerfCpuCountByVariant()
+        Log.d(LOG_TAG, "Frequency probe failed, falling back to variant heuristic", e)
+        runCatching { computeByVariant() }.getOrElse { fallback() }
     }
 
-    private fun getHighPerfCpuCountByFrequencies(): Int =
-        getCpuValues(property = "processor") { getMaxCpuFrequency(it.toInt()) }
-            .also { Log.d(LOG_TAG, "Binned cpu frequencies (max MHz, count): ${it.binnedValues()}") }
-            .countDroppingMin()
+    /**
+     * Reads cpuinfo_max_freq of every listed "processor" and applies the ratio
+     * heuristic described above.
+     */
+    private fun computeByFrequencies(): Int {
+        val freqs = lines
+            .asSequence()
+            .filter { it.startsWith("processor") }
+            .map { it.substringAfter(':').trim().toInt() }
+            .map { getMaxCpuFrequency(it) }
+            .sorted()
+            .toList()
 
-    private fun getHighPerfCpuCountByVariant(): Int =
-        getCpuValues(property = "CPU variant") { it.substringAfter("0x").toInt(radix = 16) }
-            .also { Log.d(LOG_TAG, "Binned cpu variants (variant, count): ${it.binnedValues()}") }
-            .countKeepingMin()
+        check(freqs.isNotEmpty()) { "No CPU cores found in /proc/cpuinfo" }
 
-    private fun List<Int>.binnedValues() = groupingBy { it }.eachCount()
+        val lo = freqs.first()
+        val hi = freqs.last()
+        val ratio = lo.toDouble() / hi.toDouble()
+        val keepAll = ratio >= LOW_HIGH_RATIO_THRESHOLD
 
-    private fun getCpuValues(property: String, mapper: (String) -> Int) = lines
-        .asSequence()
-        .filter { it.startsWith(property) }
-        .map { mapper(it.substringAfter(':').trim()) }
-        .sorted()
-        .toList()
+        val qualified = if (keepAll) freqs.size else freqs.count { it > lo }
+        val binned = freqs.groupingBy { it }.eachCount()
 
-    private fun List<Int>.countDroppingMin(): Int {
-        val min = min()
-        return count { it > min }
+        Log.d(LOG_TAG, "CPU max MHz (sorted): $freqs")
+        Log.d(LOG_TAG, "Binned MHz -> count: $binned ; lo=$lo hi=$hi ratio=${
+            "%.2f".format(ratio)} keepAll=$keepAll qualified=$qualified")
+
+        // Reserve 1 core for the UI/binder/render threads.
+        val threads = (qualified - 1).coerceAtLeast(2)
+        Log.d(LOG_TAG, "Computed thread count = $threads (reserved 1 for UI)")
+        return threads
     }
 
-    private fun List<Int>.countKeepingMin(): Int {
-        val min = min()
-        return count { it == min }
+    /**
+     * Fallback when sysfs freq files aren't readable: use the "CPU variant"
+     * hex field from /proc/cpuinfo and keep only the highest-variant cluster.
+     * Works on older ARMeabi designs where variant encodes the core tier.
+     */
+    private fun computeByVariant(): Int {
+        val variants = lines
+            .asSequence()
+            .filter { it.startsWith("CPU variant") }
+            .map { it.substringAfter("0x").trim().toInt(radix = 16) }
+            .sorted()
+            .toList()
+        check(variants.isNotEmpty()) { "No CPU variant entries in /proc/cpuinfo" }
+        val kept = variants.count { it == variants.max() }
+        Log.d(LOG_TAG, "Variant heuristic kept $kept cores")
+        return (kept - 1).coerceAtLeast(2)
+    }
+
+    private fun fallback(): Int {
+        val n = Runtime.getRuntime().availableProcessors()
+        Log.d(LOG_TAG, "Using naive fallback: availableProcessors($n) - 1")
+        return (n - 1).coerceAtLeast(2)
     }
 
     companion object {
         private const val LOG_TAG = "WhisperCpuConfig"
+        private const val LOW_HIGH_RATIO_THRESHOLD = 0.70
 
-        fun getHighPerfCpuCount(): Int = try {
-            readCpuInfo().getHighPerfCpuCount()
+        fun computeThreadCount(): Int = try {
+            readCpuInfo().computeThreadCount()
         } catch (e: Exception) {
-            Log.d(LOG_TAG, "Couldn't read CPU info", e)
-            // Last-resort: leave a couple of cores for the UI thread binder.
-            (Runtime.getRuntime().availableProcessors() - 2).coerceAtLeast(1)
+            Log.d(LOG_TAG, "Couldn't read /proc/cpuinfo", e)
+            CpuInfo(emptyList()).let {
+                runCatching { it.computeByVariant() }.getOrElse { it.fallback() }
+            }
         }
 
         private fun readCpuInfo() = CpuInfo(
