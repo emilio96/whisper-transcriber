@@ -22,7 +22,7 @@ object ModelRegistry {
         ModelDescriptor(
             id = "tiny.en",
             displayName = "Tiny (English only)",
-            sizeBytes = 75L * 1024 * 1024,
+            sizeBytes = 77_704_715L,
             url = "$HF_BASE/ggml-tiny.en.bin",
             multilingual = false,
             sha256 = null,
@@ -32,7 +32,7 @@ object ModelRegistry {
         ModelDescriptor(
             id = "tiny",
             displayName = "Tiny (multilingual)",
-            sizeBytes = 75L * 1024 * 1024,
+            sizeBytes = 77_691_713L,
             url = "$HF_BASE/ggml-tiny.bin",
             multilingual = true,
             sha256 = null,
@@ -42,7 +42,7 @@ object ModelRegistry {
         ModelDescriptor(
             id = "base.en",
             displayName = "Base (English only)",
-            sizeBytes = 142L * 1024 * 1024,
+            sizeBytes = 147_964_211L,
             url = "$HF_BASE/ggml-base.en.bin",
             multilingual = false,
             sha256 = null,
@@ -52,7 +52,7 @@ object ModelRegistry {
         ModelDescriptor(
             id = "base",
             displayName = "Base (multilingual)",
-            sizeBytes = 145L * 1024 * 1024,
+            sizeBytes = 147_951_465L,
             url = "$HF_BASE/ggml-base.bin",
             multilingual = true,
             sha256 = null,
@@ -62,7 +62,7 @@ object ModelRegistry {
         ModelDescriptor(
             id = "small.en",
             displayName = "Small (English only)",
-            sizeBytes = 466L * 1024 * 1024,
+            sizeBytes = 487_614_201L,
             url = "$HF_BASE/ggml-small.en.bin",
             multilingual = false,
             sha256 = null,
@@ -72,7 +72,7 @@ object ModelRegistry {
         ModelDescriptor(
             id = "small",
             displayName = "Small (multilingual)",
-            sizeBytes = 488L * 1024 * 1024,
+            sizeBytes = 487_601_967L,
             url = "$HF_BASE/ggml-small.bin",
             multilingual = true,
             sha256 = null,

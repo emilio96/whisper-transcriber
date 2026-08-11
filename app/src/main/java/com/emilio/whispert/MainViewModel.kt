@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.emilio.whispert.models.DeviceProfile
@@ -54,13 +55,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _language = MutableStateFlow(prefs.getString(KEY_LANGUAGE, "auto") ?: "auto")
     val language: StateFlow<String> = _language.asStateFlow()
 
+    /**
+     * Build the full visible list of models = the static registry + any imported
+     * models the user has loaded via SAF. Imported models persist across launches
+     * via the ModelManager's SharedPreferences-backed runtime registry.
+     */
+    private fun visibleModels(): List<ModelDescriptor> =
+        ModelRegistry.ALL + modelManager.listImported()
+
     // ---------- models slice ----------
     private val _modelsState = MutableStateFlow(
         ModelsUiState(
-            registry = ModelRegistry.ALL,
+            registry = visibleModels(),
             deviceClass = deviceProfile.deviceClass,
             deviceDescription = deviceProfile.describe(),
-            modelStates = ModelRegistry.ALL.associate { it.id to stateFor(it) },
+            modelStates = visibleModels().associate { it.id to stateFor(it) },
             activeModelId = modelManager.activeModelId(),
         )
     )
@@ -80,14 +89,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun refreshModelsState() {
+        val visible = visibleModels()
         val cur = _modelsState.value
         _modelsState.value = cur.copy(
+            registry = visible,
             activeModelId = modelManager.activeModelId(),
-            modelStates = cur.modelStates.mapValues { (id, st) ->
-                val desc = ModelRegistry.byId(id)
-                st.copy(
+            modelStates = visible.associate { desc ->
+                desc.id to ModelItemState(
+                    descriptor = desc,
                     downloaded = modelManager.isDownloaded(desc),
-                    active = modelManager.activeModelId() == id,
+                    active = modelManager.activeModelId() == desc.id,
+                    downloading = cur.modelStates[desc.id]?.downloading ?: false,
+                    progress = cur.modelStates[desc.id]?.progress ?: 0f,
+                    error = cur.modelStates[desc.id]?.error,
                 )
             }
         )
@@ -148,6 +162,32 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (!modelManager.isDownloaded(desc)) return
         modelManager.setActiveModelId(desc.id)
         refreshModelsState()
+    }
+
+    /**
+     * Imports a .bin model file picked with SAF (e.g. one the user already had on
+     * the device, downloaded via a browser or copied via USB). Streams the SAF
+     * stream into filesDir/models/ggml-imported-<N>.bin and activates it.
+     */
+    fun importModel(uri: Uri) {
+        viewModelScope.launch {
+            _transcribeState.value = TranscribeUiState.Busy("Importing model from file…")
+            try {
+                // Drop any currently-loaded native context because we are about to
+                // switch the active model to the imported one.
+                if (loadedModelId != null) {
+                    whisperCtx?.releaseBlocking()
+                    whisperCtx = null
+                    loadedModelId = null
+                }
+                modelManager.importFromFile(uri)
+                refreshModelsState()
+                _transcribeState.value = TranscribeUiState.Idle
+            } catch (t: Throwable) {
+                refreshModelsState()
+                _transcribeState.value = TranscribeUiState.Error("Import failed: ${t.message ?: t.toString()}")
+            }
+        }
     }
 
 
@@ -265,6 +305,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         return ModelReady(whisperCtx, active, null)
     }
 
+    /**
+     * Writes [content] to a SAF-selected destination [uri] (typically Downloads
+     * or Documents). Returns true on success. The UI exposes this from the
+     * 'Done' state via ActivityResultContracts.CreateDocument.
+     */
+    suspend fun saveTranscriptTo(content: String, uri: Uri): Boolean = withContext(Dispatchers.IO) {
+        try {
+            getApplication<Application>().contentResolver.openOutputStream(uri, "w")?.use { out ->
+                out.write(content.toByteArray())
+                true
+            } ?: false
+        } catch (t: Throwable) {
+            Log.w(TAG_VM, "Export failed", t)
+            false
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
         whisperCtx?.releaseBlocking()
@@ -273,6 +330,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     companion object {
+        private const val TAG_VM = "MainViewModel"
         private const val PREFS = "whispert"
         private const val KEY_AUDIO_URI = "audio_uri"
         private const val KEY_LANGUAGE = "language"

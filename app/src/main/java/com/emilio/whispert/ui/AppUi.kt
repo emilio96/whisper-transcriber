@@ -47,6 +47,7 @@ import com.emilio.whispert.MainViewModel
 import com.emilio.whispert.ModelItemState
 import com.emilio.whispert.ModelsUiState
 import com.emilio.whispert.TranscribeUiState
+import kotlinx.coroutines.launch
 import java.util.Locale
 
 @Composable
@@ -57,6 +58,7 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
     val modelsState by vm.modelsState.collectAsState()
 
     var selectedTab by remember { mutableIntStateOf(0) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
 
     Scaffold { inner ->
         Column(modifier = Modifier.padding(inner).fillMaxSize()) {
@@ -74,12 +76,16 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                     onLanguageChange = { vm.setLanguage(it) },
                     onTranscribe = { vm.transcribe() },
                     onTranscribeJfk = { vm.transcribeBundledJfk() },
+                    onSaveTranscript = { text, uri ->
+                        scope.launch { vm.saveTranscriptTo(text, uri) }
+                    },
                     activeModelId = modelsState.activeModelId,
                 )
                 1 -> ModelsTab(state = modelsState,
                     onDownload = { vm.downloadModel(it) },
                     onDelete = { vm.deleteModel(it) },
-                    onActivate = { vm.activateModel(it) })
+                    onActivate = { vm.activateModel(it) },
+                    onImportModelUri = { vm.importModel(it) })
             }
         }
     }
@@ -95,12 +101,29 @@ private fun TranscribeTab(
     onLanguageChange: (String) -> Unit,
     onTranscribe: () -> Unit,
     onTranscribeJfk: () -> Unit,
+    onSaveTranscript: (text: String, uri: Uri) -> Unit,
     activeModelId: String?,
 ) {
     // SAF picker: any audio/* file from Documents/Downloads etc.
     val pickAudio = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
     ) { uri -> if (uri != null) onPickAudioPicked(uri) }
+
+    // SAF saver: ActivityResultContracts.CreateDocument opens the system file
+    // picker in 'create new file' mode; we hand the chosen Uri back to the VM
+    // with the transcript text. We hold the in-flight text in this state so the
+    // callback (called later when the user confirms the destination filename)
+    // still knows what to write.
+    var pendingSaveText by remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+    val saveTxt = rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.CreateDocument("text/plain"),
+    ) { uri ->
+        if (uri != null) {
+            val text = pendingSaveText
+            if (text != null) onSaveTranscript(text, uri)
+        }
+        pendingSaveText = null
+    }
 
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
@@ -168,6 +191,14 @@ private fun TranscribeTab(
                          modifier = Modifier.padding(12.dp),
                          style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
                 }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Button(onClick = {
+                        pendingSaveText = s.text
+                        saveTxt.launch("transcript_${System.currentTimeMillis()}.txt")
+                    }) { Text("Save .txt") }
+                    Spacer(Modifier.size(12.dp))
+                    OutlinedButton(onClick = { onTranscribe() }) { Text("Re-run") }
+                }
             }
             is TranscribeUiState.Error -> Text("✗ ${s.message}", color = MaterialTheme.colorScheme.error)
         }
@@ -180,7 +211,12 @@ private fun ModelsTab(
     onDownload: (com.emilio.whispert.models.ModelDescriptor) -> Unit,
     onDelete: (com.emilio.whispert.models.ModelDescriptor) -> Unit,
     onActivate: (com.emilio.whispert.models.ModelDescriptor) -> Unit,
+    onImportModelUri: (Uri) -> Unit,
 ) {
+    val pickModel = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri -> if (uri != null) onImportModelUri(uri) }
+
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -195,6 +231,18 @@ private fun ModelsTab(
         }
         Text("All downloads go to private app storage. The first download needs internet; "
              + "afterwards transcriptions run fully offline.", style = MaterialTheme.typography.bodySmall)
+
+        HorizontalDivider()
+        Text("Already have a .bin model file on this phone?", fontWeight = FontWeight.SemiBold)
+        Button(onClick = { pickModel.launch(arrayOf("*/*")) }) {
+            Text("Load model from file (SAF)")
+        }
+        Text(
+            "Picks any model .bin you already downloaded (e.g. via browser) or copied via USB. " +
+            "We copy it into private app storage and add it to the list above. Disable english-only " +
+            "models with the 'en' language in the Transcribe tab.",
+            style = MaterialTheme.typography.bodySmall,
+        )
     }
 }
 

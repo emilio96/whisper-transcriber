@@ -1,6 +1,7 @@
 package com.emilio.whispert.models
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
@@ -32,7 +33,7 @@ class ModelManager(private val context: Context) {
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     val modelDir: File = File(context.filesDir, "models").apply { mkdirs() }
 
-    /** Returns the cached model file if present (fully downloaded), else null. */
+    /** Returns the cached model file if present (fully downloaded/imported), else null. */
     fun cachedFile(desc: ModelDescriptor): File? {
         val f = File(modelDir, desc.localFilename())
         return if (f.exists() && f.length() == desc.sizeBytes) f else null
@@ -52,12 +53,14 @@ class ModelManager(private val context: Context) {
     fun activeModel(): ModelDescriptor? {
         val id = activeModelId() ?: return null
         return runCatching { ModelRegistry.byId(id) }.getOrNull()?.takeIf { isDownloaded(it) }
+            ?: importedById(id)?.takeIf { isDownloaded(it) }
     }
 
     /** Deletes a cached model file (and clears active selection if it was active). */
     fun deleteModel(desc: ModelDescriptor) {
         cachedFile(desc)?.delete()
         if (activeModelId() == desc.id) setActiveModelId(null)
+        if (desc.id.startsWith(IMPORTED_PREFIX)) removeImported(desc.id)
     }
 
     /**
@@ -83,7 +86,12 @@ class ModelManager(private val context: Context) {
             val code = conn.responseCode
             require(code in 200..299) { "HTTP $code for ${desc.url}" }
 
-            val total = (conn.contentLengthLong.takeIf { it > 0 } ?: desc.sizeBytes).toFloat()
+            // The server's Content-Length is the truth about the file. Fall back to
+            // the descriptor's hardcoded size only if the server is using chunked
+            // encoding (chunked => -1). This makes the truncation check robust to
+            // upstream re-uploads that slightly shift the file size.
+            val expectedLen: Long = conn.contentLengthLong.takeIf { it > 0 } ?: desc.sizeBytes
+            val total = expectedLen.toFloat()
             val sha = desc.sha256?.let { MessageDigest.getInstance("SHA-256") }
             FileOutputStream(tmp).use { out ->
                 conn.inputStream.use { input ->
@@ -109,11 +117,13 @@ class ModelManager(private val context: Context) {
                 }
             }
 
-            // Atomic-ish rename over the final path. Validates final length.
+            // Atomic-ish rename over the final path. Validates final length
+            // against the server-declared Content-Length (or the descriptor size as
+            // a fallback), not the static hardcoded number.
             if (target.exists()) target.delete()
             check(tmp.renameTo(target)) { "Failed to rename ${tmp.name} -> ${target.name}" }
-            require(target.length() == desc.sizeBytes) {
-                "Truncated model: ${target.length()} / ${desc.sizeBytes} B"
+            require(target.length() == expectedLen) {
+                "Truncated model: got ${target.length()} / expected $expectedLen B"
             }
 
             setActiveModelId(desc.id)
@@ -130,9 +140,123 @@ class ModelManager(private val context: Context) {
         }
     }
 
+    /**
+     * Reads a previously-downloaded / user-imported .bin model pointed at by a
+     * SAF [uri] (any file the document picker can reach). Copies it into
+     * filesDir/models/ggml-imported-<N>.bin so whisper_init_from_file can mmap it,
+     * and registers a runtime [ModelDescriptor] with id=`imported-<N>` so it
+     * shows up in the Models tab alongside the registry entries.
+     *
+     * The descriptor is conservatively flagged multilingual=true so the language
+     * selector stays enabled in the Transcribe tab. English-only .bin files work
+     * too; the user just has to pick 'en' explicitely.
+     *
+     * Returns the descriptor of the imported model.
+     */
+    suspend fun importFromFile(uri: Uri): ModelDescriptor = withContext(Dispatchers.IO) {
+        val sequence = nextImportedSequence()
+        val id = "$IMPORTED_PREFIX$sequence"
+        val target = File(modelDir, "ggml-$id.bin")
+        Log.i(TAG, "Importing model from $uri -> ${target.absolutePath}")
+
+        var total = 0L
+        val sha = MessageDigest.getInstance("SHA-256")
+        try {
+            context.contentResolver.openInputStream(uri).use { input ->
+                requireNotNull(input) { "Cannot open InputStream for $uri" }
+                FileOutputStream(target).use { out ->
+                    val buf = ByteArray(64 * 1024)
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        out.write(buf, 0, n)
+                        sha.update(buf, 0, n)
+                        total += n
+                        ensureActive()
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            target.delete()
+            Log.e(TAG, "Import failed: ${t.message}", t)
+            throw t
+        }
+        Log.i(TAG, "Imported $id done ($total B)")
+
+        val displayName = "Imported (#$sequence)"
+        val desc = ModelDescriptor(
+            id = id,
+            displayName = displayName,
+            sizeBytes = total,
+            url = "",
+            multilingual = true,
+            sha256 = null,
+            description = "Loaded from a file you picked with SAF. You can pick language in the Transcribe tab; for English-only .bin choose 'en'.",
+            recommendedFor = emptySet(),
+        )
+        saveImported(desc)
+        setActiveModelId(id)
+        desc
+    }
+
+    // -- imported-models runtime registry ---------------------------------
+
+    /** Lists every imported model whose file still exists on disk. */
+    fun listImported(): List<ModelDescriptor> {
+        val ids = prefs.getStringSet(KEY_IMPORTED_IDS, emptySet()) ?: emptySet()
+        return ids.mapNotNull { id -> importedById(id)?.takeIf { cachedFile(it) != null } }
+    }
+
+    private fun importedById(id: String): ModelDescriptor? {
+        val str = prefs.getString("imp#$id", null) ?: return null
+        val parts = str.split(',')
+        if (parts.size < 4) return null
+        return runCatching {
+            ModelDescriptor(
+                id = id,
+                displayName = parts[0],
+                sizeBytes = parts[1].toLong(),
+                url = parts[2],
+                multilingual = parts[3] == "1",
+                sha256 = null,
+                description = "Imported from file.",
+                recommendedFor = emptySet(),
+            )
+        }.getOrNull()
+    }
+
+    private fun saveImported(desc: ModelDescriptor) {
+        val ids = (prefs.getStringSet(KEY_IMPORTED_IDS, emptySet()) ?: emptySet()).toMutableSet()
+        ids += desc.id
+        prefs.edit()
+            .putStringSet(KEY_IMPORTED_IDS, ids)
+            .putString("imp#${desc.id}", "${desc.displayName},${desc.sizeBytes},${desc.url},${if (desc.multilingual) "1" else "0"}")
+            .apply()
+        // Keep our private counter monotonic.
+        prefs.edit().putInt(KEY_IMPORTED_SEQ, desc.id.substringAfter(IMPORTED_PREFIX).toIntOrNull() ?: prefs.getInt(KEY_IMPORTED_SEQ, 0)).apply()
+    }
+
+    private fun removeImported(id: String) {
+        val ids = (prefs.getStringSet(KEY_IMPORTED_IDS, emptySet()) ?: emptySet()).toMutableSet()
+        ids.remove(id)
+        prefs.edit()
+            .putStringSet(KEY_IMPORTED_IDS, ids)
+            .remove("imp#$id")
+            .apply()
+    }
+
+    private fun nextImportedSequence(): Int {
+        val seq = prefs.getInt(KEY_IMPORTED_SEQ, 0) + 1
+        prefs.edit().putInt(KEY_IMPORTED_SEQ, seq).apply()
+        return seq
+    }
+
     companion object {
         private const val TAG = "ModelManager"
         private const val PREFS = "whispert_models"
         private const val KEY_ACTIVE = "active_model_id"
+        private const val IMPORTED_PREFIX = "imported-"
+        private const val KEY_IMPORTED_IDS = "imported_ids"
+        private const val KEY_IMPORTED_SEQ = "imported_seq"
     }
 }
