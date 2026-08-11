@@ -186,6 +186,7 @@ private fun TranscribeTab(
             is TranscribeUiState.Done -> {
                 val audioSec = s.sampleCount / 16_000.0
                 val rtf = if (audioSec > 0) (s.whisperMs / 1000.0) / audioSec else 0.0
+                val t = s.timings
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(
                         "Done in ${"%.2f".format(s.elapsedMs / 1000.0)} s " +
@@ -196,6 +197,19 @@ private fun TranscribeTab(
                             "· lang=${s.language} · model=${s.modelId}",
                         fontWeight = FontWeight.SemiBold,
                         style = MaterialTheme.typography.bodySmall,
+                    )
+                    // Whisper internal phase breakdown (in ms):
+                    //   sample = acoustic sampling (greedy/beam)
+                    //   encode = encoder transformer runs over all mel chunks (one or more)
+                    //   decode = autoregressive decoding of tokens (the expensive part on long clips)
+                    //   batchd = batched decoding overhead
+                    //   prompt = prompt/prefix caching
+                    Text(
+                        "whisper phases (ms): encode=%.0f  decode=%.0f  sample=%.0f  batchd=%.0f  prompt=%.0f"
+                            .format(t.encodeMs, t.decodeMs, t.sampleMs, t.batchdMs, t.promptMs),
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Surface(tonalElevation = 2.dp, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
                         Text(s.text.ifBlank { "(empty transcript)" },

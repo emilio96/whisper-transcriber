@@ -191,7 +191,7 @@ Java_com_emilio_whispert_whisper_WhisperLib_00024Companion_fullTranscribe(
     struct whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     params.print_realtime = false;        // we render in UI instead
     params.print_progress = false;
-    params.print_timestamps = false;
+    params.print_timestamps = false;      // segment timestamps live in the JNI query APIs
     params.print_special = false;
     params.translate = false;
     params.language = lang_chars ? lang_chars : "en";
@@ -255,4 +255,24 @@ Java_com_emilio_whispert_whisper_WhisperLib_00024Companion_getSystemInfo(
     UNUSED(thiz);
     const char *sysinfo = whisper_print_system_info();
     return (*env)->NewStringUTF(env, sysinfo);
+}
+
+// Returns a one-line CSV of phase timings (in ms) extracted from the last
+// whisper_full run: "sample_ms,encode_ms,decode_ms,batchd_ms,prompt_ms". Caller
+// parses it into a WhisperTimings data class for live UI rendering, so the user
+// doesn't have to dig through logcat.
+JNIEXPORT jstring JNICALL
+Java_com_emilio_whispert_whisper_WhisperLib_00024Companion_getTimings(
+        JNIEnv *env, jobject thiz, jlong context_ptr) {
+    UNUSED(thiz);
+    struct whisper_context *context = (struct whisper_context *) context_ptr;
+    struct whisper_timings *t = whisper_get_timings(context);
+    if (t == NULL) {
+        return (*env)->NewStringUTF(env, "0,0,0,0,0");
+    }
+    char buf[160];
+    snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,%.2f,%.2f",
+             t->sample_ms, t->encode_ms, t->decode_ms, t->batchd_ms, t->prompt_ms);
+    delete t;
+    return (*env)->NewStringUTF(env, buf);
 }

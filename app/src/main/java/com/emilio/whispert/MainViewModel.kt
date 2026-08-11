@@ -230,14 +230,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
                 _transcribeState.value = TranscribeUiState.Busy("Whisper running… (${samples.size} samples)")
                 val whisperStart = System.currentTimeMillis()
-                val text = ctx.transcribe(samples, language = language, printTimestamps = true)
+                val result = ctx.transcribe(samples, language = language, printTimestamps = true)
                 val whisperMs = System.currentTimeMillis() - whisperStart
                 val elapsed = System.currentTimeMillis() - start
                 _transcribeState.value = TranscribeUiState.Done(
-                    text = text,
+                    text = result.text,
                     elapsedMs = elapsed,
                     decodeMs = decodeMs,
                     whisperMs = whisperMs,
+                    timings = result.timings,
                     language = language,
                     modelName = activeDesc.displayName,
                     modelId = activeDesc.id,
@@ -273,14 +274,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val decodeMs = System.currentTimeMillis() - start
                 _transcribeState.value = TranscribeUiState.Busy("Whisper running… (${samples.size} samples)")
                 val whisperStart = System.currentTimeMillis()
-                val text = ctx.transcribe(samples, language = language, printTimestamps = true)
+                val result = ctx.transcribe(samples, language = language, printTimestamps = true)
                 val whisperMs = System.currentTimeMillis() - whisperStart
                 val elapsed = System.currentTimeMillis() - start
                 _transcribeState.value = TranscribeUiState.Done(
-                    text = text,
+                    text = result.text,
                     elapsedMs = elapsed,
                     decodeMs = decodeMs,
                     whisperMs = whisperMs,
+                    timings = result.timings,
                     language = language,
                     modelName = activeDesc.displayName,
                     modelId = activeDesc.id,
@@ -358,6 +360,7 @@ sealed interface TranscribeUiState {
         val elapsedMs: Long,
         val decodeMs: Long,
         val whisperMs: Long,
+        val timings: com.emilio.whispert.whisper.WhisperTimings,
         val language: String,
         val modelName: String,
         val modelId: String,

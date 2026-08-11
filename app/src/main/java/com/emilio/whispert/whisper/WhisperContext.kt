@@ -36,25 +36,27 @@ class WhisperContext private constructor(private var ptr: Long) {
         audioData: FloatArray,
         language: String = "en",
         printTimestamps: Boolean = true,
-    ): String = withContext(singleThreadDispatcher) {
+    ): TranscriptionResult = withContext(singleThreadDispatcher) {
         check(ptr != 0L) { "WhisperContext has already been released" }
         val numThreads = WhisperCpuConfig.preferredThreadCount
         Log.d(LOG_TAG, "Transcribing ${audioData.size} samples with $numThreads threads")
         WhisperLib.fullTranscribe(ptr, numThreads, language, audioData)
 
         val segmentCount = WhisperLib.getTextSegmentCount(ptr)
-        buildString {
+        val text = buildString {
             for (i in 0 until segmentCount) {
-                val text = WhisperLib.getTextSegment(ptr, i)
+                val seg = WhisperLib.getTextSegment(ptr, i)
                 if (printTimestamps) {
                     val t0 = WhisperLib.getTextSegmentT0(ptr, i)
                     val t1 = WhisperLib.getTextSegmentT1(ptr, i)
-                    append("[${toTimestamp(t0)} --> ${toTimestamp(t1)}] $text\n")
+                    append("[${toTimestamp(t0)} --> ${toTimestamp(t1)}] $seg\n")
                 } else {
-                    append(text)
+                    append(seg)
                 }
             }
         }
+        val timings = WhisperTimings.parse(WhisperLib.getTimings(ptr))
+        TranscriptionResult(text = text, timings = timings)
     }
 
     /** Graceful async release. Use from coroutines/UI code. */
@@ -139,3 +141,25 @@ private fun toTimestamp(t: Long): String {
     msec -= sec * 1000
     return String.format("%02d:%02d:%02d.%03d", hr, min, sec, msec)
 }
+
+/** Whisper internal phase timings extracted from the native context. */
+data class WhisperTimings(
+    val sampleMs: Float,
+    val encodeMs: Float,
+    val decodeMs: Float,
+    val batchdMs: Float,
+    val promptMs: Float,
+) {
+    companion object {
+        fun parse(csv: String): WhisperTimings {
+            val parts = csv.split(',')
+            fun f(i: Int) = parts.getOrElse(i) { "0" }.toFloatOrNull() ?: 0f
+            return WhisperTimings(f(0), f(1), f(2), f(3), f(4))
+        }
+    }
+}
+
+data class TranscriptionResult(
+    val text: String,
+    val timings: WhisperTimings,
+)
