@@ -21,6 +21,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -30,7 +31,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -148,17 +148,17 @@ private fun TranscribeTab(
         Text(audioUri?.let { "File: ${shortened(it)}" } ?: "Pick a mp3/m4a/wav/opus from anywhere reachable.",
              style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
 
-        // Language selector (only relevant for multilingual models; EN-only pins 'en')
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        // Language selector (only relevant for multilingual models; EN-only pins 'en').
+        // FilterChip with a clear selected-background state so the active choice
+        // is obvious (the old TextButton-only-color-tint was too subtle).
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("Language: ", style = MaterialTheme.typography.bodyMedium)
             listOf("auto", "en", "it").forEach { lang ->
-                TextButton(
+                FilterChip(
+                    selected = language == lang,
                     onClick = { onLanguageChange(lang) },
-                    colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
-                        contentColor = if (language == lang) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                ) { Text(lang.uppercase(Locale.ROOT)) }
+                    label = { Text(lang.uppercase(Locale.ROOT)) },
+                )
             }
         }
 
@@ -183,21 +183,33 @@ private fun TranscribeTab(
                     Text("⏳ ${s.message}")
                 }
             }
-            is TranscribeUiState.Done -> Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Done in ${s.elapsedMs} ms · ${s.sampleCount} samples · lang=${s.language} · model=${s.modelId}",
-                     fontWeight = FontWeight.SemiBold)
-                Surface(tonalElevation = 2.dp, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    Text(s.text.ifBlank { "(empty transcript)" },
-                         modifier = Modifier.padding(12.dp),
-                         style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Button(onClick = {
-                        pendingSaveText = s.text
-                        saveTxt.launch("transcript_${System.currentTimeMillis()}.txt")
-                    }) { Text("Save .txt") }
-                    Spacer(Modifier.size(12.dp))
-                    OutlinedButton(onClick = { onTranscribe() }) { Text("Re-run") }
+            is TranscribeUiState.Done -> {
+                val audioSec = s.sampleCount / 16_000.0
+                val rtf = if (audioSec > 0) (s.whisperMs / 1000.0) / audioSec else 0.0
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        "Done in ${"%.2f".format(s.elapsedMs / 1000.0)} s " +
+                            "(decode ${"%.2f".format(s.decodeMs / 1000.0)} s + " +
+                            "whisper ${"%.2f".format(s.whisperMs / 1000.0)} s) " +
+                            "· ${"%.2f".format(audioSec)} s audio " +
+                            "· RTF ${"%.2f".format(rtf)}× " +
+                            "· lang=${s.language} · model=${s.modelId}",
+                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Surface(tonalElevation = 2.dp, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        Text(s.text.ifBlank { "(empty transcript)" },
+                             modifier = Modifier.padding(12.dp),
+                             style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Button(onClick = {
+                            pendingSaveText = s.text
+                            saveTxt.launch("transcript_${System.currentTimeMillis()}.txt")
+                        }) { Text("Save .txt") }
+                        Spacer(Modifier.size(12.dp))
+                        OutlinedButton(onClick = { onTranscribe() }) { Text("Re-run") }
+                    }
                 }
             }
             is TranscribeUiState.Error -> Text("✗ ${s.message}", color = MaterialTheme.colorScheme.error)
