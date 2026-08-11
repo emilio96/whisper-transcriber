@@ -257,6 +257,12 @@ Java_com_emilio_whispert_whisper_WhisperLib_00024Companion_getSystemInfo(
     return (*env)->NewStringUTF(env, sysinfo);
 }
 
+// Forward-declared in C linkage by whisper_timings_bridge.cpp. We use a tiny
+// C++ wrapper around whisper_get_timings() because that function returns memory
+// allocated with `new` and the public whisper.h does not expose a deleter; only
+// the C++ side can safely `delete` it.
+extern void whisper_timings_to_csv(struct whisper_context * ctx, char * out, int out_len);
+
 // Returns a one-line CSV of phase timings (in ms) extracted from the last
 // whisper_full run: "sample_ms,encode_ms,decode_ms,batchd_ms,prompt_ms". Caller
 // parses it into a WhisperTimings data class for live UI rendering, so the user
@@ -266,13 +272,7 @@ Java_com_emilio_whispert_whisper_WhisperLib_00024Companion_getTimings(
         JNIEnv *env, jobject thiz, jlong context_ptr) {
     UNUSED(thiz);
     struct whisper_context *context = (struct whisper_context *) context_ptr;
-    struct whisper_timings *t = whisper_get_timings(context);
-    if (t == NULL) {
-        return (*env)->NewStringUTF(env, "0,0,0,0,0");
-    }
-    char buf[160];
-    snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,%.2f,%.2f",
-             t->sample_ms, t->encode_ms, t->decode_ms, t->batchd_ms, t->prompt_ms);
-    delete t;
+    char buf[160] = {0};
+    whisper_timings_to_csv(context, buf, (int) sizeof(buf));
     return (*env)->NewStringUTF(env, buf);
 }

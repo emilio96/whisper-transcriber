@@ -31,6 +31,7 @@ set(
     SOURCE_FILES
     ${WHISPER_LIB_DIR}/src/whisper.cpp
     ${CMAKE_SOURCE_DIR}/whisper_jni.c
+    ${CMAKE_SOURCE_DIR}/whisper_timings_bridge.cpp
 )
 
 find_library(LOG_LIB log)
