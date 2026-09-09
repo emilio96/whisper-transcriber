@@ -1,13 +1,13 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
-   See https://developer.android.com/guide/topics/data/autobackup
-   for details.
-   Note: This file is ignored for devices older than API 31
-   See https://developer.android.com/about/versions/12/backup-restore
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   Auto Backup rules (API 30 and below; API 31+ uses data_extraction_rules.xml).
+
+   Only the small preference files travel. Whisper models are hundreds of MB to
+   several GB and the decoded-audio cache holds the user's recordings: neither
+   belongs in a cloud backup, and both are trivially reproducible (re-download /
+   re-decode). Listing sharedpref as the only include leaves every other domain
+   (files/, cache/, ...) out by construction.
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <include domain="sharedpref" path="." />
 </full-backup-content>

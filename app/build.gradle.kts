@@ -32,14 +32,22 @@ android {
             // Use the CMake installed via SDK Manager (currently 4.1.2).
             // Setting this explicitly avoids Gradle auto-downloading 3.22.x.
             version = "4.1.2"
+            // NOTE: ggml tuning flags (GGML_OPENMP / GGML_LLAMAFILE /
+            // GGML_CPU_ARM_ARCH) are set in src/main/cpp/CMakeLists.txt, not
+            // here - AGP 9 removed the cmake.arguments DSL.
         }
     }
 
     buildTypes {
         release {
-            optimization {
-                enable = false
-            }
+            // R8 is on: the JNI entry points and ONNX Runtime's reflective
+            // surface are protected by explicit keep rules in proguard-rules.pro.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
     compileOptions {
@@ -50,11 +58,14 @@ android {
         compose = true
     }
 
-    // Extract native libs to disk on install so System.loadLibrary works
-    // reliably against mmap-style model loading done by whisper_init_*.
+    // Ship the .so files uncompressed and page-aligned so the loader maps them
+    // straight out of the APK. Legacy packaging (the previous setting) extracts
+    // a second copy to disk at install time and buys nothing here: the ggml
+    // model .bin files live in filesDir and have nothing to do with how the
+    // native libraries are packaged.
     packaging {
         jniLibs {
-            useLegacyPackaging = true
+            useLegacyPackaging = false
         }
     }
 }
@@ -63,12 +74,14 @@ dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)
+    implementation("androidx.compose.material:material-icons-core")
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

@@ -32,8 +32,15 @@ import java.io.FileReader
  * (long) whisper inference. Floor at 2 threads.
  */
 object WhisperCpuConfig {
-    val preferredThreadCount: Int
-        get() = CpuInfo.computeThreadCount().coerceAtLeast(2)
+    /**
+     * Computed once per process. The probe reads /proc/cpuinfo plus one sysfs
+     * file per core, and this value is also surfaced in the settings UI: as a
+     * recomputing getter it ran that disk I/O on the main thread on every
+     * recomposition.
+     */
+    val preferredThreadCount: Int by lazy {
+        CpuInfo.computeThreadCount().coerceAtLeast(2)
+    }
 }
 
 private class CpuInfo(private val lines: List<String>) {

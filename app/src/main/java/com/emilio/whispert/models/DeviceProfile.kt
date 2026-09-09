@@ -36,6 +36,23 @@ data class DeviceProfile(
     companion object {
         private const val TAG = "DeviceProfile"
 
+        fun getHardwareInfoSummary(cores: Int, autoThreads: Int): String {
+            val soc = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                android.os.Build.SOC_MODEL.ifBlank { android.os.Build.HARDWARE }
+            } else {
+                android.os.Build.HARDWARE
+            }
+            val manufacturer = android.os.Build.MANUFACTURER
+            val model = android.os.Build.MODEL
+            val board = android.os.Build.BOARD
+            return buildString {
+                appendLine("• Device: $manufacturer $model")
+                appendLine("• SoC / Hardware: $soc (Board: $board)")
+                appendLine("• Total Physical Cores: $cores")
+                appendLine("• Auto-selected Worker Threads: $autoThreads (Big-Cores)")
+            }
+        }
+
         fun probe(context: Context): DeviceProfile {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
             val mem = ActivityManager.MemoryInfo()

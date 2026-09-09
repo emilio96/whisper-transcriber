@@ -36,7 +36,7 @@ class ModelManager(private val context: Context) {
     /** Returns the cached model file if present (fully downloaded/imported), else null. */
     fun cachedFile(desc: ModelDescriptor): File? {
         val f = File(modelDir, desc.localFilename())
-        return if (f.exists() && f.length() == desc.sizeBytes) f else null
+        return if (f.exists() && f.length() > 1_000_000L) f else null
     }
 
     fun isDownloaded(desc: ModelDescriptor): Boolean = cachedFile(desc) != null
@@ -58,7 +58,8 @@ class ModelManager(private val context: Context) {
 
     /** Deletes a cached model file (and clears active selection if it was active). */
     fun deleteModel(desc: ModelDescriptor) {
-        cachedFile(desc)?.delete()
+        val f = File(modelDir, desc.localFilename())
+        if (f.exists()) f.delete()
         if (activeModelId() == desc.id) setActiveModelId(null)
         if (desc.id.startsWith(IMPORTED_PREFIX)) removeImported(desc.id)
     }
@@ -117,22 +118,24 @@ class ModelManager(private val context: Context) {
                 }
             }
 
-            // Atomic-ish rename over the final path. Validates final length
-            // against the server-declared Content-Length (or the descriptor size as
-            // a fallback), not the static hardcoded number.
+            // Validate the download *before* it can replace a good file: a
+            // truncated transfer must never take out the model the user already
+            // had working on disk.
+            require(tmp.length() == expectedLen) {
+                "Truncated model: got ${tmp.length()} / expected $expectedLen B"
+            }
+
             if (target.exists()) target.delete()
             check(tmp.renameTo(target)) { "Failed to rename ${tmp.name} -> ${target.name}" }
-            require(target.length() == expectedLen) {
-                "Truncated model: got ${target.length()} / expected $expectedLen B"
-            }
 
             setActiveModelId(desc.id)
             onProgress(1f)
             Log.i(TAG, "Download ${desc.id} done (${target.length()} B)")
             target
         } catch (t: Throwable) {
+            // Only the partial file goes: on a failed re-download the previously
+            // downloaded model stays exactly where it was.
             tmp.delete()
-            target.delete()
             Log.e(TAG, "Download failed: ${t.message}", t)
             throw t
         } finally {
@@ -186,6 +189,7 @@ class ModelManager(private val context: Context) {
         val displayName = "Imported (#$sequence)"
         val desc = ModelDescriptor(
             id = id,
+            family = ModelFamily.CUSTOM,
             displayName = displayName,
             sizeBytes = total,
             url = "",
@@ -214,6 +218,7 @@ class ModelManager(private val context: Context) {
         return runCatching {
             ModelDescriptor(
                 id = id,
+                family = ModelFamily.CUSTOM,
                 displayName = parts[0],
                 sizeBytes = parts[1].toLong(),
                 url = parts[2],

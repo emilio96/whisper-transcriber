@@ -1,0 +1,187 @@
+diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
+index dc6453c6..a2263221 100644
+--- a/ggml/include/ggml-cpu.h
++++ b/ggml/include/ggml-cpu.h
+@@ -37,6 +37,11 @@ extern "C" {
+     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
+     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+ 
++    // Debug aid: returns the per-op timing breakdown of the last graph compute
++    // that took longer than 100 ms ("" if none yet). Written by the
++    // instrumentation in ggml-cpu.c; consumed by the whisper JNI diagnostics.
++    GGML_BACKEND_API const char * ggml_perf_last_dump(void);
++
+     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
+     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
+ 
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 491316f7..b07de5fc 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3057,6 +3057,116 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++// ============================================================================
++// Per-node timing instrumentation (debug aid).
++// Worker 0 accumulates wall time per distinct op; at the end of each graph
++// compute that took > 100 ms the breakdown is rendered into a static buffer
++// that the whisper JNI diagnostics surface in-app (and to logcat as
++// "ggml-perf"). This is how we found the slow ops in the encoder graph.
++// ============================================================================
++#if defined(__ANDROID__)
++// The dump is surfaced in-app via ggml_perf_last_dump() (see whisper_jni.c
++// getModelInfo); no logcat dependency needed.
++#define GGML_PERF_LOG(...) ((void) 0)
++#else
++#define GGML_PERF_LOG(...) GGML_LOG_INFO(__VA_ARGS__)
++#endif
++
++#define GGML_PERF_MAX_ENTRIES 128
++#define GGML_PERF_DUMP_MIN_US 100000 // only dump graphs slower than 100 ms
++
++struct ggml_perf_entry {
++    char     name[64];
++    int64_t  us;
++    int      count;
++};
++
++static struct ggml_perf_entry ggml_perf_entries[GGML_PERF_MAX_ENTRIES];
++static int                     ggml_perf_n_entries = 0;
++static int64_t                 ggml_perf_best_total_us = 0; // keep the slowest graph
++static int                     ggml_perf_best_n_threads = 0;
++static char                    ggml_perf_dump_buf[4096];
++
++static void ggml_perf_add(const struct ggml_tensor * node, int n_fused, int64_t us) {
++    char key[64];
++
++    if (n_fused > 0) {
++        snprintf(key, sizeof(key), "FUSED(%s)", ggml_op_name(node->op));
++    } else if (node->op == GGML_OP_MUL_MAT) {
++        snprintf(key, sizeof(key), "MUL_MAT(%s) %ldx%ld",
++                 ggml_type_name(node->src[0]->type),
++                 (long) node->ne[0], (long) node->ne[1]);
++    } else {
++        snprintf(key, sizeof(key), "%s %ldx%ld",
++                 ggml_op_name(node->op), (long) node->ne[0], (long) node->ne[1]);
++    }
++
++    for (int i = 0; i < ggml_perf_n_entries; ++i) {
++        if (strcmp(ggml_perf_entries[i].name, key) == 0) {
++            ggml_perf_entries[i].us    += us;
++            ggml_perf_entries[i].count += 1;
++            return;
++        }
++    }
++
++    if (ggml_perf_n_entries < GGML_PERF_MAX_ENTRIES) {
++        snprintf(ggml_perf_entries[ggml_perf_n_entries].name, 64, "%s", key);
++        ggml_perf_entries[ggml_perf_n_entries].us    = us;
++        ggml_perf_entries[ggml_perf_n_entries].count = 1;
++        ggml_perf_n_entries += 1;
++    }
++}
++
++static void ggml_perf_finish_graph(int n_threads) {
++    if (ggml_perf_n_entries == 0) {
++        return;
++    }
++
++    int64_t total_us = 0;
++    for (int i = 0; i < ggml_perf_n_entries; ++i) {
++        total_us += ggml_perf_entries[i].us;
++    }
++
++    // Only replace the previous dump if this graph was slower (the encoder
++    // graph is the one we care about; the cross-attention graph is computed
++    // after it and would otherwise overwrite it).
++    if (total_us >= GGML_PERF_DUMP_MIN_US && total_us >= ggml_perf_best_total_us) {
++        ggml_perf_best_total_us = total_us;
++        ggml_perf_best_n_threads = n_threads;
++
++        // insertion sort by time (desc)
++        for (int i = 1; i < ggml_perf_n_entries; ++i) {
++            struct ggml_perf_entry tmp = ggml_perf_entries[i];
++            int j = i - 1;
++            while (j >= 0 && ggml_perf_entries[j].us < tmp.us) {
++                ggml_perf_entries[j + 1] = ggml_perf_entries[j];
++                j -= 1;
++            }
++            ggml_perf_entries[j + 1] = tmp;
++        }
++
++        int off = 0;
++        off += snprintf(ggml_perf_dump_buf + off, sizeof(ggml_perf_dump_buf) - off,
++                        "perf: total=%lld ms (%d ops, threads=%d)\n",
++                        (long long) (total_us / 1000), ggml_perf_n_entries, n_threads);
++        for (int i = 0; i < ggml_perf_n_entries && off < (int) sizeof(ggml_perf_dump_buf); ++i) {
++            off += snprintf(ggml_perf_dump_buf + off, sizeof(ggml_perf_dump_buf) - off,
++                            "  %8.1f ms  x%-3d  %s\n",
++                            ggml_perf_entries[i].us / 1000.0,
++                            ggml_perf_entries[i].count,
++                            ggml_perf_entries[i].name);
++        }
++
++        GGML_PERF_LOG("%s", ggml_perf_dump_buf);
++    }
++
++    ggml_perf_n_entries = 0;
++}
++
++GGML_BACKEND_API const char * ggml_perf_last_dump(void) {
++    return ggml_perf_dump_buf;
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3097,6 +3207,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++        int64_t ggml_perf_t0 = 0;
++        if (state->ith == 0) {
++            ggml_perf_t0 = ggml_time_us();
++        }
++
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+@@ -3115,6 +3230,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++
++        if (state->ith == 0) {
++            ggml_perf_add(node, n_fused, ggml_time_us() - ggml_perf_t0);
++        }
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+@@ -3417,6 +3536,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+ 
+     enum ggml_status ret = threadpool->ec;
+ 
++    ggml_perf_finish_graph(n_threads);
++
+     if (disposable_threadpool) {
+         ggml_threadpool_free(threadpool);
+     }
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index 2a95bdb1..43b3080e 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -1558,6 +1558,13 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
+             return false;
+         }
+ 
++        // The default intermediate type (F16) is meant for GPU backends (Metal/CUDA
++        // f16 kernels). On CPU the f16 matmul/softmax paths in ggml are slower than
++        // the NEON f32 ones, and each K/V cast costs an extra pass over the tensor.
++        // Measured on Snapdragon 8 Elite (tiny encoder, 1500-token window): the
++        // attention ops dropped from ~260 ms to ~150 ms with F32 intermediates.
++        wctx.itype = GGML_TYPE_F32;
++
+         WHISPER_LOG_INFO("%s: n_vocab       = %d\n", __func__, hparams.n_vocab);
+         WHISPER_LOG_INFO("%s: n_audio_ctx   = %d\n", __func__, hparams.n_audio_ctx);
+         WHISPER_LOG_INFO("%s: n_audio_state = %d\n", __func__, hparams.n_audio_state);
