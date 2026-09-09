@@ -295,6 +295,7 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                         onTranscribeJfk = { vm.transcribeBundledJfk() },
                         onRediarize = { vm.rediarize() },
                         canRediarize = canRediarize,
+                        onClearDiarization = { vm.clearDiarization() },
                         onCancel = { vm.cancelTranscription() },
                         onSaveTranscript = { text, uri ->
                             scope.launch { vm.saveTranscriptTo(text, uri) }
@@ -383,6 +384,7 @@ private fun TranscribeTab(
     onTranscribeJfk: () -> Unit,
     onRediarize: () -> Unit,
     canRediarize: Boolean,
+    onClearDiarization: () -> Unit,
     onCancel: () -> Unit,
     onSaveTranscript: (text: String, uri: Uri) -> Unit,
     onSaveReport: (text: String, uri: Uri) -> Unit,
@@ -657,7 +659,15 @@ private fun TranscribeTab(
                     // cache: no decode, no whisper. This is the loop for trying
                     // a different diarization engine or setting.
                     if (canRediarize) {
-                        OutlinedButton(onClick = onRediarize) { Text("Re-run diarization only") }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedButton(onClick = onRediarize) { Text("Re-run diarization only") }
+                            // Only worth offering when there is something to
+                            // clear; re-running the pass brings the labels back.
+                            if (s.segments.any { it.speaker != null }) {
+                                Spacer(Modifier.size(10.dp))
+                                OutlinedButton(onClick = onClearDiarization) { Text("Clear speakers") }
+                            }
+                        }
                     }
 
                     // 3. Collapsible dropdown / accordion for statistics & diagnostics

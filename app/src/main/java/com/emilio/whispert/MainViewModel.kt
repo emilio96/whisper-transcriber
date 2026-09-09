@@ -911,6 +911,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Drops the speaker labels and republishes the plain transcript.
+     *
+     * Purely a re-render of the run we already have: [LastRun.result] keeps the
+     * segments exactly as whisper produced them, before any speaker pass, so
+     * this costs nothing and is reversible with [rediarize].
+     */
+    fun clearDiarization() {
+        val last = lastRun ?: return
+        if (transcribeJob?.isActive == true) return
+        emitDone(last, SpeakerDiarization.Outcome(last.result.segments, null, 0))
+    }
+
     private suspend fun publishDone(
         result: com.emilio.whispert.whisper.TranscriptionResult,
         diarization: SpeakerDiarization.Outcome,
