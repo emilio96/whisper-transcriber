@@ -136,9 +136,4 @@ object ModelRegistry {
 
     fun byId(id: String): ModelDescriptor =
         ALL.firstOrNull { it.id == id } ?: error("Unknown model id: $id")
-
-    fun visibleFor(clazz: DeviceClass): List<ModelDescriptor> = ALL
-
-    fun recommendedFor(clazz: DeviceClass): List<ModelDescriptor> =
-        ALL.filter { clazz in it.recommendedFor }
 }

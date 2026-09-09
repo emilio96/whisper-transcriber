@@ -71,13 +71,5 @@ data class DeviceProfile(
             Log.i(TAG, "Profiled device: $deviceClass (RAM=${totalMem / (1024*1024)} MB, cores=$cores)")
             return DeviceProfile(deviceClass, totalMem, cores)
         }
-
-        /** A small multilingual model that's almost always safe to start with on a class. */
-        fun defaultModelFor(clazz: DeviceClass): String = when (clazz) {
-            DeviceClass.LOW -> "tiny"          // 75 MB multilingual
-            DeviceClass.MID -> "base"          // 145 MB multilingual
-            DeviceClass.HIGH -> "small"        // 488 MB multilingual, good quality
-            DeviceClass.FLAGSHIP -> "small"    // Comfortable on Snapdragon 8 Elite tier; turbo reserved as opt-in
-        }
     }
 }

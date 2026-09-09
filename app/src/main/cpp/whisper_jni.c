@@ -23,6 +23,7 @@
 #include <stdbool.h>
 #include <inttypes.h>
 #include <string.h>
+#include <pthread.h>
 #include "whisper.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -39,14 +40,21 @@
 // ---------------------------------------------------------------------------
 // Cancellation + progress plumbing (whisper_full_params callbacks)
 // ---------------------------------------------------------------------------
-// Set from any thread via cancelTranscription(); consumed atomically by
-// abort_cb on the transcription thread at every graph boundary. Reset at the
-// start of each run, so a late cancel never leaks into the next transcription.
-static volatile int g_abort_requested = 0;
+// One flag per phase, because the two do not run on the same thread and can
+// overlap: the decode runs on the caller's thread while whisper_full is still
+// finishing on the inference executor. With a single shared flag, cancelling a
+// run in progress and immediately starting a new one made the new run's decode
+// reset the flag that the old whisper_full had not yet observed, so the cancel
+// was swallowed and the old transcription kept going to completion.
+//
+// Set from any thread by cancelTranscription(); each phase clears only its own
+// flag at its own start, so a late cancel never leaks into the next run.
+static volatile int g_abort_transcribe = 0;
+static volatile int g_abort_decode = 0;
 
 static bool abort_cb(void * user_data) {
     UNUSED(user_data);
-    return __atomic_load_n(&g_abort_requested, __ATOMIC_RELAXED) != 0;
+    return __atomic_load_n(&g_abort_transcribe, __ATOMIC_RELAXED) != 0;
 }
 
 // Cached JVM + WhisperProgress methods
@@ -56,17 +64,57 @@ static jmethodID g_progress_mid = NULL;
 static jmethodID g_decode_progress_mid = NULL;
 static jmethodID g_new_segment_mid = NULL;
 
+// Reachable from the inference thread, the decode thread and the callback
+// threads, so the lazy init needs a lock: without one, two threads racing here
+// each installed a NewGlobalRef and one of them leaked permanently.
+static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static void cache_progress_methods(JNIEnv *env) {
+    pthread_mutex_lock(&g_cache_mutex);
+    if (g_progress_cls != NULL) {
+        pthread_mutex_unlock(&g_cache_mutex);
+        return;
+    }
+
     jclass cls = (*env)->FindClass(env, "com/emilio/whispert/whisper/WhisperProgress");
     if (cls == NULL) {
         (*env)->ExceptionClear(env);
+        pthread_mutex_unlock(&g_cache_mutex);
         return;
     }
-    g_progress_cls = (jclass)(*env)->NewGlobalRef(env, cls);
-    g_progress_mid = (*env)->GetStaticMethodID(env, g_progress_cls, "onProgress", "(I)V");
-    g_decode_progress_mid = (*env)->GetStaticMethodID(env, g_progress_cls, "onDecodeProgress", "(I)V");
-    g_new_segment_mid = (*env)->GetStaticMethodID(env, g_progress_cls, "onNewSegment", "(Ljava/lang/String;JJ)V");
+
+    jclass global = (jclass)(*env)->NewGlobalRef(env, cls);
     (*env)->DeleteLocalRef(env, cls);
+    if (global == NULL) {
+        (*env)->ExceptionClear(env);
+        pthread_mutex_unlock(&g_cache_mutex);
+        return;
+    }
+
+    const jmethodID progress = (*env)->GetStaticMethodID(env, global, "onProgress", "(I)V");
+    const jmethodID decode   = (*env)->GetStaticMethodID(env, global, "onDecodeProgress", "(I)V");
+    const jmethodID segment  = (*env)->GetStaticMethodID(env, global, "onNewSegment", "(Ljava/lang/String;JJ)V");
+
+    // A failed GetStaticMethodID leaves an exception pending; any further JNI
+    // call on this env with one pending is undefined behaviour, so clear it
+    // here rather than letting it escape into the caller.
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+    if (progress == NULL || decode == NULL || segment == NULL) {
+        LOGE("WhisperProgress found but its callback methods did not resolve; progress events disabled");
+        (*env)->DeleteGlobalRef(env, global);
+        pthread_mutex_unlock(&g_cache_mutex);
+        return;
+    }
+
+    g_progress_mid = progress;
+    g_decode_progress_mid = decode;
+    g_new_segment_mid = segment;
+    // Published last, with release semantics: a reader that sees a non-NULL
+    // class is guaranteed to see the three method ids that go with it.
+    __atomic_store_n(&g_progress_cls, global, __ATOMIC_RELEASE);
+
+    pthread_mutex_unlock(&g_cache_mutex);
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
@@ -87,7 +135,8 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
 }
 
 static void ensure_progress_class(JNIEnv *env) {
-    if (g_progress_cls == NULL && env != NULL) {
+    if (env == NULL) return;
+    if (__atomic_load_n(&g_progress_cls, __ATOMIC_ACQUIRE) == NULL) {
         cache_progress_methods(env);
     }
 }
@@ -249,7 +298,7 @@ static int run_whisper_full(struct whisper_context *context, const float *sample
     params.initial_prompt = (p->initial_prompt && p->initial_prompt[0]) ? p->initial_prompt : NULL;
 
     // Fresh run: clear any stale cancel request and wire the callbacks.
-    __atomic_store_n(&g_abort_requested, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_abort_transcribe, 0, __ATOMIC_RELAXED);
     params.progress_callback = progress_cb;
     params.progress_callback_user_data = NULL;
     params.new_segment_callback = new_segment_cb;
@@ -268,14 +317,14 @@ static int run_whisper_full(struct whisper_context *context, const float *sample
          n_samples, params.n_threads, params.language, params.temperature, params.temperature_inc,
          (int)params.no_context, params.initial_prompt ? params.initial_prompt : "");
     int rc = whisper_full(context, params, samples, n_samples);
-    const int aborted = __atomic_exchange_n(&g_abort_requested, 0, __ATOMIC_RELAXED);
+    const int aborted = __atomic_exchange_n(&g_abort_transcribe, 0, __ATOMIC_RELAXED);
     if (rc != 0) {
         if (aborted) {
             LOGI("whisper_full aborted by user (rc=%d, partial segments kept)", rc);
             return 1;
         }
         LOGE("whisper_full failed with code %d", rc);
-        return rc != 0 ? rc : -1;
+        return rc;
     }
     whisper_print_timings(context);
     return 0;
@@ -285,8 +334,11 @@ JNIEXPORT void JNICALL
 Java_com_emilio_whispert_whisper_WhisperLib_00024Companion_cancelTranscription(
         JNIEnv *env, jobject thiz) {
     UNUSED(env); UNUSED(thiz);
-    __atomic_store_n(&g_abort_requested, 1, __ATOMIC_RELAXED);
-    LOGI("Cancel requested - aborting at next graph boundary");
+    // Cancels whichever phase is running: the caller does not know whether the
+    // run it is aborting is still decoding or already transcribing.
+    __atomic_store_n(&g_abort_transcribe, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_abort_decode, 1, __ATOMIC_RELAXED);
+    LOGI("Cancel requested - aborting decode loop / next graph boundary");
 }
 
 JNIEXPORT jint JNICALL
@@ -509,6 +561,13 @@ Java_com_emilio_whispert_whisper_WhisperLib_00024Companion_getTextSegment(
     UNUSED(thiz);
     struct whisper_context *context = (struct whisper_context *) context_ptr;
     if (context == NULL) return (*env)->NewStringUTF(env, "");
+    // whisper_full_get_segment_* index result_all with std::vector::operator[],
+    // which does not bounds check: an out-of-range index is an OOB read feeding
+    // a garbage pointer straight into NewStringUTF.
+    if (index < 0 || index >= whisper_full_n_segments(context)) {
+        LOGW("getTextSegment: index %d out of range (n=%d)", (int)index, whisper_full_n_segments(context));
+        return (*env)->NewStringUTF(env, "");
+    }
     const char *text = whisper_full_get_segment_text(context, index);
     return (*env)->NewStringUTF(env, text != NULL ? text : "");
 }
@@ -519,6 +578,7 @@ Java_com_emilio_whispert_whisper_WhisperLib_00024Companion_getTextSegmentT0(
     UNUSED(env); UNUSED(thiz);
     struct whisper_context *context = (struct whisper_context *) context_ptr;
     if (context == NULL) return 0;
+    if (index < 0 || index >= whisper_full_n_segments(context)) return 0;
     return whisper_full_get_segment_t0(context, index);
 }
 
@@ -528,6 +588,7 @@ Java_com_emilio_whispert_whisper_WhisperLib_00024Companion_getTextSegmentT1(
     UNUSED(env); UNUSED(thiz);
     struct whisper_context *context = (struct whisper_context *) context_ptr;
     if (context == NULL) return 0;
+    if (index < 0 || index >= whisper_full_n_segments(context)) return 0;
     return whisper_full_get_segment_t1(context, index);
 }
 
@@ -618,7 +679,7 @@ static void native_decode_on_progress(float p, void* user_data) {
 
 static bool native_decode_is_cancelled(void* user_data) {
     UNUSED(user_data);
-    return __atomic_load_n(&g_abort_requested, __ATOMIC_RELAXED) != 0;
+    return __atomic_load_n(&g_abort_decode, __ATOMIC_RELAXED) != 0;
 }
 
 JNIEXPORT jint JNICALL
@@ -628,7 +689,7 @@ Java_com_emilio_whispert_whisper_WhisperLib_00024Companion_nativeDecodeAudioFd(
     UNUSED(thiz);
     if (g_jvm == NULL) (*env)->GetJavaVM(env, &g_jvm);
     ensure_progress_class(env);
-    __atomic_store_n(&g_abort_requested, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_abort_decode, 0, __ATOMIC_RELAXED);
     const char *c_out_wav = (*env)->GetStringUTFChars(env, out_wav_path, NULL);
     if (c_out_wav == NULL) return -1;
 

@@ -125,7 +125,13 @@ class SpeakerModelManager(private val context: Context) {
                 status == HttpURLConnection.HTTP_SEE_OTHER ||
                 status == 307 || status == 308
             ) {
-                val newUrl = conn.getHeaderField("Location") ?: break
+                val newUrl = conn.getHeaderField("Location")
+                if (newUrl == null) {
+                    // A redirect status with no Location header: bail out, but
+                    // not before releasing the connection like every other path.
+                    conn.disconnect()
+                    throw IllegalStateException("Redirect from $currentUrl carried no Location header")
+                }
                 conn.disconnect()
                 currentUrl = if (newUrl.startsWith("http://") || newUrl.startsWith("https://")) {
                     newUrl

@@ -38,14 +38,24 @@ class TranscriptionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
+        // A null intent means the system restarted us after killing the process.
+        // The transcription died with that process, so there is nothing left to
+        // protect: staying up would mean a three-hour WakeLock and a notification
+        // claiming work that no longer exists. Shut down instead.
+        if (intent == null) {
+            android.util.Log.i(TAG, "Restarted with a null intent (process death); no work to resume, stopping")
             stopForegroundService()
             return START_NOT_STICKY
         }
 
-        val title = intent?.getStringExtra(EXTRA_TITLE) ?: "Whisper Transcriber"
-        val message = intent?.getStringExtra(EXTRA_MESSAGE) ?: "Processing audio…"
-        val progress = intent?.getIntExtra(EXTRA_PROGRESS, -1) ?: -1
+        if (intent.action == ACTION_STOP) {
+            stopForegroundService()
+            return START_NOT_STICKY
+        }
+
+        val title = intent.getStringExtra(EXTRA_TITLE) ?: "Whisper Transcriber"
+        val message = intent.getStringExtra(EXTRA_MESSAGE) ?: "Processing audio…"
+        val progress = intent.getIntExtra(EXTRA_PROGRESS, -1)
 
         val notification = buildNotification(this, title, message, progress)
         // The typed overload only exists from API 29; minSdk here is 28.
@@ -54,7 +64,10 @@ class TranscriptionService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
-        return START_STICKY
+        // Not sticky: the transcription lives in the app process and cannot be
+        // resumed from a restarted service, so a restart would only ever produce
+        // a WakeLock with nothing behind it.
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
@@ -88,8 +101,17 @@ class TranscriptionService : Service() {
     }
 
     companion object {
+        private const val TAG = "TranscriptionService"
+
         const val CHANNEL_ID = "whisper_transcription_channel"
         const val NOTIFICATION_ID = 1001
+
+        /**
+         * Creating the channel is idempotent but it is still a binder call into
+         * system_server, and update() runs on the inference thread once a second.
+         * Once per process is enough.
+         */
+        private val channelCreated = java.util.concurrent.atomic.AtomicBoolean(false)
 
         const val ACTION_START = "com.emilio.whispert.START_FOREGROUND"
         const val ACTION_STOP = "com.emilio.whispert.STOP_FOREGROUND"
@@ -99,6 +121,7 @@ class TranscriptionService : Service() {
         const val EXTRA_PROGRESS = "extra_progress"
 
         private fun createNotificationChannel(context: Context) {
+            if (!channelCreated.compareAndSet(false, true)) return
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Transcription Service",
@@ -150,7 +173,7 @@ class TranscriptionService : Service() {
             try {
                 context.startForegroundService(intent)
             } catch (t: Throwable) {
-                android.util.Log.e("TranscriptionService", "Failed to start foreground service", t)
+                android.util.Log.e(TAG, "Failed to start foreground service", t)
             }
         }
 
@@ -171,7 +194,7 @@ class TranscriptionService : Service() {
             } catch (_: SecurityException) {
                 // POST_NOTIFICATIONS not granted: the work continues regardless.
             } catch (t: Throwable) {
-                android.util.Log.w("TranscriptionService", "Notification update failed", t)
+                android.util.Log.w(TAG, "Notification update failed", t)
             }
         }
 
@@ -180,7 +203,7 @@ class TranscriptionService : Service() {
             try {
                 context.stopService(intent)
             } catch (t: Throwable) {
-                android.util.Log.w("TranscriptionService", "Failed to stop service", t)
+                android.util.Log.w(TAG, "Failed to stop service", t)
             }
         }
     }

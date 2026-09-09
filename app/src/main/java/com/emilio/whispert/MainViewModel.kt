@@ -32,12 +32,15 @@ import com.emilio.whispert.whisper.mappedPcmSource
 import java.io.File
 import java.security.MessageDigest
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -82,9 +85,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _speakerModelError = MutableStateFlow<String?>(null)
     val speakerModelError: StateFlow<String?> = _speakerModelError.asStateFlow()
 
+    // Why a model-library action was refused, shown on the Models screen.
+    private val _modelActionError = MutableStateFlow<String?>(null)
+    val modelActionError: StateFlow<String?> = _modelActionError.asStateFlow()
+
+    private var speakerDownloadJob: Job? = null
+
     fun downloadSpeakerModel() {
         if (_speakerModelDownloading.value) return
-        viewModelScope.launch {
+        speakerDownloadJob = viewModelScope.launch {
             _speakerModelDownloading.value = true
             _speakerModelProgress.value = 0f
             _speakerModelError.value = null
@@ -93,6 +102,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     _speakerModelProgress.value = p
                 }
                 _speakerModelDownloaded.value = true
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 Log.e(LOG_TAG, "Failed to download neural speaker model", t)
                 _speakerModelError.value = t.message ?: t.toString()
@@ -102,13 +113,26 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Deleting has to cancel an in-flight download and wait for it to unwind
+     * before touching the file. Otherwise the download coroutine is still
+     * writing while we delete, and on completion it sets downloaded = true for
+     * a file the user just removed - leaving the UI claiming a model that is
+     * not there, with the engine already switched back to DSP.
+     */
     fun deleteSpeakerModel() {
-        speakerModelManager.deleteModel()
-        _speakerModelDownloaded.value = false
-        _speakerModelDownloading.value = false
-        _speakerModelProgress.value = 0f
-        if (_settings.value.diarizationEngine == DiarizationEngine.NEURAL_ONNX) {
-            updateSettings(_settings.value.copy(diarizationEngine = DiarizationEngine.ACOUSTIC_DSP))
+        val inFlight = speakerDownloadJob
+        speakerDownloadJob = null
+        viewModelScope.launch {
+            inFlight?.cancelAndJoin()
+            withContext(Dispatchers.IO) { speakerModelManager.deleteModel() }
+            _speakerModelDownloaded.value = false
+            _speakerModelDownloading.value = false
+            _speakerModelProgress.value = 0f
+            _speakerModelError.value = null
+            if (_settings.value.diarizationEngine == DiarizationEngine.NEURAL_ONNX) {
+                updateSettings(_settings.value.copy(diarizationEngine = DiarizationEngine.ACOUSTIC_DSP))
+            }
         }
     }
 
@@ -358,21 +382,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun refreshModelsState() {
         val visible = visibleModels()
-        val cur = _modelsState.value
-        _modelsState.value = cur.copy(
-            registry = visible,
-            activeModelId = modelManager.activeModelId(),
-            modelStates = visible.associate { desc ->
-                desc.id to ModelItemState(
-                    descriptor = desc,
-                    downloaded = modelManager.isDownloaded(desc),
-                    active = modelManager.activeModelId() == desc.id,
-                    downloading = cur.modelStates[desc.id]?.downloading ?: false,
-                    progress = cur.modelStates[desc.id]?.progress ?: 0f,
-                    error = cur.modelStates[desc.id]?.error,
-                )
-            }
-        )
+        val activeId = modelManager.activeModelId()
+        val downloaded = visible.associate { it.id to modelManager.isDownloaded(it) }
+        _modelsState.update { cur ->
+            cur.copy(
+                registry = visible,
+                activeModelId = activeId,
+                modelStates = visible.associate { desc ->
+                    desc.id to ModelItemState(
+                        descriptor = desc,
+                        downloaded = downloaded[desc.id] == true,
+                        active = activeId == desc.id,
+                        downloading = cur.modelStates[desc.id]?.downloading ?: false,
+                        progress = cur.modelStates[desc.id]?.progress ?: 0f,
+                        error = cur.modelStates[desc.id]?.error,
+                    )
+                }
+            )
+        }
     }
 
     // ---------- audio selection ----------
@@ -424,7 +451,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Guards the model-library actions against a live run.
+     *
+     * Both deleting and importing tear down the native context, and release()
+     * queues behind the in-flight whisper_full on the single-thread inference
+     * executor: the button would simply hang until the transcription finished,
+     * with no indication why. Import additionally overwrote the transcribe
+     * state, wiping the running job's progress off the screen.
+     */
+    private fun blockedByActiveRun(action: String): Boolean {
+        if (transcribeJob?.isActive != true) return false
+        _modelActionError.value = "Cannot $action while a transcription is running. Stop it first."
+        return true
+    }
+
+    fun clearModelActionError() {
+        _modelActionError.value = null
+    }
+
     fun deleteModel(desc: ModelDescriptor) {
+        if (blockedByActiveRun("delete a model")) return
+        _modelActionError.value = null
         viewModelScope.launch {
             // Drop the native context first if this is the loaded model, so the
             // memory is gone before the file is.
@@ -440,6 +488,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun activateModel(desc: ModelDescriptor) {
         if (!modelManager.isDownloaded(desc)) return
+        if (blockedByActiveRun("switch models")) return
+        _modelActionError.value = null
         modelManager.setActiveModelId(desc.id)
         refreshModelsState()
     }
@@ -449,6 +499,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * filesDir/models/ggml-imported-<N>.bin and activates it.
      */
     fun importModel(uri: Uri) {
+        if (blockedByActiveRun("import a model")) return
+        _modelActionError.value = null
         viewModelScope.launch {
             _transcribeState.value = TranscribeUiState.Busy("Importing model from file…")
             try {
@@ -469,11 +521,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Download progress arrives on Dispatchers.IO while refreshModelsState()
+     * runs on main, and both were doing a plain load-copy-store on the same
+     * StateFlow: a progress tick could be lost, or could resurrect the state a
+     * concurrent activate/delete had just written. update() retries on a
+     * concurrent write instead.
+     */
     private fun updateItem(id: String, block: (ModelItemState) -> ModelItemState) {
-        val cur = _modelsState.value
-        _modelsState.value = cur.copy(modelStates = cur.modelStates.mapValues { (k, v) ->
-            if (k == id) block(v) else v
-        })
+        _modelsState.update { cur ->
+            cur.copy(modelStates = cur.modelStates.mapValues { (k, v) ->
+                if (k == id) block(v) else v
+            })
+        }
     }
 
     // ---------- transcription ----------
@@ -563,7 +623,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             WhisperLib.cancelTranscription()
             transcribeJob?.cancel()
         }
-        transcribeJob = viewModelScope.launch {
+        // The cleanup in the finally must only fire for the run that still owns
+        // the field. A cancelled job resumes its finally on the main dispatcher
+        // *after* its replacement has been assigned, so an unguarded
+        // `transcribeJob = null` there would clear the new job's handle - letting
+        // a third run start in parallel past the isActive guard above - and stop
+        // the foreground service out from under it. Hence the identity check.
+        //
+        // LAZY so that the assignment below happens first: on
+        // Dispatchers.Main.immediate an eagerly started coroutine runs up to its
+        // first suspension point before launch() even returns, and the identity
+        // check would then be comparing against the previous run's handle.
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             TranscriptionService.start(getApplication(), "Whisper Transcriber", "Initializing transcription…")
             try {
                 body()
@@ -575,10 +646,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 Log.e(LOG_TAG, "Transcription failed", t)
                 _transcribeState.value = TranscribeUiState.Error("Transcribe failed: ${describe(t)}")
             } finally {
-                TranscriptionService.stop(getApplication())
-                transcribeJob = null
+                if (transcribeJob === coroutineContext[Job]) {
+                    TranscriptionService.stop(getApplication())
+                    transcribeJob = null
+                }
             }
         }
+        transcribeJob = job
+        job.start()
     }
 
     private suspend fun runFileTranscription(uri: Uri) {
@@ -598,12 +673,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         var decodeMs = 0L
         val sampleCount: Int
 
-        if (pcmFile.exists() && pcmFile.length() > 44) {
-            Log.i(LOG_TAG, "Using existing cached decoded WAV: ${pcmFile.absolutePath} (${pcmFile.length()} bytes)")
-            sampleCount = ((pcmFile.length() - 44) / 2).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        // stat() and the mtime touch are disk I/O; the rest of this method is
+        // careful to keep that off the main dispatcher, and these were missed.
+        val cachedLength = withContext(Dispatchers.IO) {
+            if (pcmFile.exists()) pcmFile.length() else 0L
+        }
+
+        if (cachedLength > 44) {
+            Log.i(LOG_TAG, "Using existing cached decoded WAV: ${pcmFile.absolutePath} ($cachedLength bytes)")
+            sampleCount = ((cachedLength - 44) / 2).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
             val durStr = com.emilio.whispert.ui.formatDurationSeconds((sampleCount / 16000f).toDouble())
             _lastDecodeInfo.value = "⚡ Loaded from cache ($durStr audio, decode: 0.0s)"
-            pcmFile.setLastModified(System.currentTimeMillis()) // keep it hot for LRU eviction
+            // Keep it hot for LRU eviction.
+            withContext(Dispatchers.IO) { pcmFile.setLastModified(System.currentTimeMillis()) }
         } else {
             _transcribeState.value = TranscribeUiState.Busy("Decoding audio…", progress = 0f)
             TranscriptionService.update(getApplication(), "Whisper Transcriber", "Decoding audio…", 0)
@@ -778,8 +860,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         } catch (e: CancellationException) {
             throw e
         } catch (t: Throwable) {
+            // Degrading to an undiarized result is the right call - the
+            // transcript itself is fine - but it used to happen silently, so a
+            // crashed engine was indistinguishable from the feature being off.
             Log.e(LOG_TAG, "Post-processing diarization failed", t)
-            SpeakerDiarization.Outcome(segments, null, 0)
+            SpeakerDiarization.Outcome(segments, null, 0, failure = describe(t))
         }
     }
 
@@ -880,6 +965,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             speakerCount = diarization.speakerCount,
             diarizeThreshold = diarization.mergeThreshold,
             diarizeStats = diarization.stats,
+            diarizeError = diarization.failure,
             timings = last.timings,
             language = last.language,
             modelName = last.desc.displayName,
@@ -994,6 +1080,8 @@ sealed interface TranscribeUiState {
         val diarizeThreshold: Float = 0f,
         val diarizeStats: com.emilio.whispert.whisper.DiarizationStats =
             com.emilio.whispert.whisper.DiarizationStats(),
+        /** Non-null when speaker identification was requested but failed. */
+        val diarizeError: String? = null,
         val timings: com.emilio.whispert.whisper.WhisperTimings,
         val language: String,
         val modelName: String,

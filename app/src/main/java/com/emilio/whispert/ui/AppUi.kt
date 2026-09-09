@@ -74,6 +74,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -118,7 +119,7 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
     val speakerModelError by vm.speakerModelError.collectAsState()
     val canRediarize by vm.canRediarize.collectAsState()
 
-    var currentScreen by remember { mutableStateOf(AppScreen.TRANSCRIBE) }
+    var currentScreen by rememberSaveable { mutableStateOf(AppScreen.TRANSCRIBE) }
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
 
@@ -392,7 +393,10 @@ private fun TranscribeTab(
         contract = ActivityResultContracts.OpenDocument(),
     ) { uri -> if (uri != null) onPickAudioPicked(uri) }
 
-    var pendingSaveText by remember { mutableStateOf<String?>(null) }
+    // Saveable: the CreateDocument dialog can outlive the Activity (rotation,
+    // process death). With a plain remember the pending payload came back null
+    // and the file the user had just chosen was written empty - silently.
+    var pendingSaveText by rememberSaveable { mutableStateOf<String?>(null) }
     val saveTxt = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("text/plain"),
     ) { uri ->
@@ -403,7 +407,7 @@ private fun TranscribeTab(
         pendingSaveText = null
     }
 
-    var pendingSaveReport by remember { mutableStateOf<String?>(null) }
+    var pendingSaveReport by rememberSaveable { mutableStateOf<String?>(null) }
     val saveReport = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("text/markdown"),
     ) { uri ->
@@ -414,7 +418,7 @@ private fun TranscribeTab(
         pendingSaveReport = null
     }
 
-    var showDiagnostics by remember { mutableStateOf(false) }
+    var showDiagnostics by rememberSaveable { mutableStateOf(false) }
 
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
@@ -707,6 +711,9 @@ private fun TranscribeTab(
                                         "• Embedding extraction: ${formatDurationMs(s.diarizeExtractMs)}, clustering: ${formatDurationMs(s.diarizeClusterMs)}\n" +
                                         "• Speakers identified: $speakersStr\n" +
                                         clusteringDetail(s)
+                                    } else if (s.diarizeError != null) {
+                                        "• Speaker diarization: FAILED - ${s.diarizeError}\n" +
+                                        "• The transcript below is complete but has no speaker labels.\n"
                                     } else {
                                         "• Speaker diarization: Disabled\n"
                                     }
@@ -808,6 +815,8 @@ private fun buildReport(s: TranscribeUiState.Done): String {
             clusteringDetail(s).lines().filter { it.isNotBlank() }.forEach {
                 appendLine("  - ${it.removePrefix("• ")}")
             }
+        } else if (s.diarizeError != null) {
+            appendLine("- **Speaker Diarization**: FAILED - ${s.diarizeError}")
         } else if (distinctSpeakers.isNotEmpty()) {
             appendLine("- **Speakers Identified**: ${distinctSpeakers.size} (${distinctSpeakers.joinToString(", ")})")
         }

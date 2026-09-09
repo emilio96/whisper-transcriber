@@ -1,13 +1,32 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
+
+// Release signing is driven by a keystore.properties that stays out of VCS
+// (see keystore.properties.template). When it is absent - a fresh clone, CI
+// without secrets - the release build still assembles, just unsigned, instead
+// of failing the whole configuration phase.
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
+}
+val hasReleaseKeystore = keystoreProperties.getProperty("storeFile") != null
 
 android {
     namespace = "com.emilio.whispert"
     compileSdk {
         version = release(37)
     }
+
+    // Pinned to the NDK this project has actually been built and measured with.
+    // Left floating, the toolchain is whatever SDK Manager happens to have, and
+    // the native codegen (-march, NEON, LTO) can differ between machines.
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "com.emilio.whispert"
@@ -38,8 +57,25 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            create("release") {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = if (hasReleaseKeystore) {
+                signingConfigs.getByName("release")
+            } else {
+                logger.warn("No keystore.properties found: assembleRelease will produce an UNSIGNED APK.")
+                null
+            }
             // R8 is on: the JNI entry points and ONNX Runtime's reflective
             // surface are protected by explicit keep rules in proguard-rules.pro.
             isMinifyEnabled = true
@@ -74,14 +110,14 @@ dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)
-    implementation("androidx.compose.material:material-icons-core")
+    implementation(libs.androidx.compose.material.icons.core)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
+    implementation(libs.onnxruntime.android)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

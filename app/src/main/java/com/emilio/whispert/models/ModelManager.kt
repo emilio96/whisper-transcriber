@@ -7,6 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -124,6 +125,7 @@ class ModelManager(private val context: Context) {
             require(tmp.length() == expectedLen) {
                 "Truncated model: got ${tmp.length()} / expected $expectedLen B"
             }
+            requireGgmlMagic(tmp)
 
             if (target.exists()) target.delete()
             check(tmp.renameTo(target)) { "Failed to rename ${tmp.name} -> ${target.name}" }
@@ -186,6 +188,16 @@ class ModelManager(private val context: Context) {
         }
         Log.i(TAG, "Imported $id done ($total B)")
 
+        // The picked file is arbitrary: without this, anything at all could be
+        // handed to whisper_init_from_file, which reads the header before it
+        // validates much of anything.
+        try {
+            requireGgmlMagic(target)
+        } catch (t: Throwable) {
+            target.delete()
+            throw t
+        }
+
         val displayName = "Imported (#$sequence)"
         val desc = ModelDescriptor(
             id = id,
@@ -201,6 +213,30 @@ class ModelManager(private val context: Context) {
         saveImported(desc)
         setActiveModelId(id)
         desc
+    }
+
+    /**
+     * Rejects a file that is not a ggml model before it can reach native code.
+     *
+     * whisper.cpp reads the header straight into its own structs, so a wrong or
+     * corrupted file is not a clean error - it is a native crash. The magic is
+     * stored as a little-endian uint32 of GGML_FILE_MAGIC (0x67676d6c), i.e.
+     * the bytes 6c 6d 67 67 at offset 0.
+     */
+    private fun requireGgmlMagic(file: File) {
+        val head = ByteArray(4)
+        val read = FileInputStream(file).use { it.read(head) }
+        val magic = if (read == 4) {
+            (head[0].toInt() and 0xFF) or
+                ((head[1].toInt() and 0xFF) shl 8) or
+                ((head[2].toInt() and 0xFF) shl 16) or
+                ((head[3].toInt() and 0xFF) shl 24)
+        } else {
+            0
+        }
+        require(magic == GGML_FILE_MAGIC) {
+            "Not a ggml model file (bad magic: 0x%08x). Whisper models are the ggml .bin files from Hugging Face.".format(magic)
+        }
     }
 
     // -- imported-models runtime registry ---------------------------------
@@ -258,6 +294,9 @@ class ModelManager(private val context: Context) {
 
     companion object {
         private const val TAG = "ModelManager"
+
+        /** ggml.h: GGML_FILE_MAGIC, "ggml" as a little-endian uint32. */
+        private const val GGML_FILE_MAGIC = 0x67676d6c
         private const val PREFS = "whispert_models"
         private const val KEY_ACTIVE = "active_model_id"
         private const val IMPORTED_PREFIX = "imported-"

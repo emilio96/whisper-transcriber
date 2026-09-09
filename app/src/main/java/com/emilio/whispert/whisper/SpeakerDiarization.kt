@@ -75,6 +75,8 @@ object SpeakerDiarization {
         val clusterMs: Long = 0L,
         val mergeThreshold: Float = 0f,
         val stats: DiarizationStats = DiarizationStats(),
+        /** Set when the pass failed and the segments came back undiarized. */
+        val failure: String? = null,
     ) {
         val totalMs: Long get() = extractMs + clusterMs
     }
