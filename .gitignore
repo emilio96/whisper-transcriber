@@ -1,12 +1,6 @@
 *.iml
 .gradle
 /local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
 .DS_Store
 /build
 /captures
@@ -14,12 +8,10 @@
 .cxx
 local.properties
 
-
 # Release signing secrets.
 /keystore.properties
 *.jks
 *.keystore
 
-# IDE run-target state: local, changes on every device pick.
-/.idea/deploymentTargetSelector.xml
-/.idea/deploymentTargetDropDown.xml
+# IDE configuration: local to each machine.
+/.idea/
